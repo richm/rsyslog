@@ -240,6 +240,10 @@ if ENABLE_OMHTTPFS
 SUBDIRS += contrib/omhttpfs
 endif
 
+if ENABLE_OMAMQP1
+SUBDIRS += plugins/omamqp1
+endif
+
 # tests are added as last element, because tests may need different
 # modules that need to be generated first
 SUBDIRS += tests
@@ -284,6 +288,7 @@ THIS_IS_TEMPORARILY_DISABLED = \
 	--enable-pmsnare \
 	--enable-elasticsearch \
 	--enable-valgrind \
+	--enable-omamqp1 \
 	--with-systemdsystemunitdir=$$dc_install_base/$(systemdsystemunitdir) 
 # temporarily disable these checks for make distcheck 2012-09-06 rgerhards
 #				--enable-mmsnmptrapd \

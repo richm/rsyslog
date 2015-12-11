@@ -1575,7 +1575,6 @@ AM_CONDITIONAL(ENABLE_OMHIREDIS, test x$enable_omhiredis = xyes)
 
 # END HIREDIS SUPPORT
 
-
 # HTTPFS SUPPORT
 
 AC_ARG_ENABLE(omhttpfs,
@@ -1658,6 +1657,26 @@ if test "x$have_to_generate_man_pages" = "xyes" && test "x$RST2MAN" = "xfalse"; 
         AC_MSG_ERROR([rst2man is required when building from git source or --enable-generate-man-pages option was set, please install python-docutils.])
 fi
 
+# AMQP 1.0 PROTOCOL SUPPORT
+# uses the Proton protocol library
+
+AC_ARG_ENABLE(omamqp1,
+        [AS_HELP_STRING([--enable-omamqp1],[Compiles omamqp1 output module @<:@default=no@:>@])],
+        [case "${enableval}" in
+         yes) enable_omamqp1="yes" ;;
+          no) enable_omamqp1="no" ;;
+           *) AC_MSG_ERROR(bad value ${enableval} for --enable-omamqp1) ;;
+         esac],
+        [enable_omamqp1=no]
+)
+if test "x$enable_omamqp1" = "xyes"; then
+        PKG_CHECK_MODULES(PROTON, libqpid-proton >= 0.9)
+        AC_SUBST(PROTON_CFLAGS)
+        AC_SUBST(PROTON_LIBS)
+fi
+AM_CONDITIONAL(ENABLE_OMAMQP1, test x$enable_omamqp1 = xyes)
+
+# END AMQP 1.0 PROTOCOL SUPPORT
 
 AC_CONFIG_FILES([Makefile \
 		runtime/Makefile \
@@ -1721,6 +1740,7 @@ AC_CONFIG_FILES([Makefile \
 		contrib/mmrfc5424addhmac/Makefile \
 		contrib/pmcisconames/Makefile \
 		contrib/omhttpfs/Makefile \
+		plugins/omamqp1/Makefile \
 		tests/Makefile])
 AC_OUTPUT
 
@@ -1770,6 +1790,7 @@ echo "    omzmq3 module will be compiled:           $enable_omzmq3"
 echo "    omczmq module will be compiled:           $enable_omczmq"
 echo "    omrabbitmq module will be compiled:       $enable_omrabbitmq"
 echo "    omhttpfs module will be compiled:         $enable_omhttpfs"
+echo "    omamqp1 module will be compiled:          $enable_omamqp1"
 echo
 echo "---{ parser modules }---"
 echo "    pmlastmsg module will be compiled:        $enable_pmlastmsg"
