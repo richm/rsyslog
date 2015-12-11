@@ -245,6 +245,10 @@ if ENABLE_ORACLE
 SUBDIRS += plugins/omoracle
 endif
 
+if ENABLE_OMAMQP1
+SUBDIRS += plugins/omamqp1
+endif
+
 if ENABLE_GUI
 SUBDIRS += java
 endif
@@ -287,6 +291,7 @@ DISTCHECK_CONFIGURE_FLAGS=	--enable-gssapi_krb5 \
 				--enable-mmsnmptrapd \
 				--enable-elasticsearch \
 				--enable-valgrind \
+				--enable-omamqp1 \
 				--with-systemdsystemunitdir=$$dc_install_base/$(systemdsystemunitdir) 
 # temporarily disable these checks for make distcheck 2012-09-06 rgerhards
 #				--enable-extended-tests \
