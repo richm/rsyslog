@@ -63,413 +63,78 @@ MODULE_CNFNAME("omamqp1")
 DEF_OMOD_STATIC_DATA
 DEFobjCurrIf(errmsg)
 
-typedef struct _instanceData {
-    int bIsRunning;     /* is I/O thread running? 0-no, 1-yes */
-    int bDisableSASL;   /* do not enable SASL? 0-enable 1-disable */
+
+/* Settings for the action */
+typedef struct _configSettings {
     uchar *url;         /* address of message bus */
-    uchar *username;
+    uchar *username;    /* authentication credentials */
     uchar *password;
-    uchar *target;
+    uchar *target;      /* endpoint for sent log messages */
     uchar *templateName;
-    //pn_connection_t *pn_connection;
+    int bDisableSASL;   /* do not enable SASL? 0-enable 1-disable */
+    int idleTimeout;    /* disconnect idle connection (seconds) */
+    int retryDelay;     /* pause before re-connecting (seconds) */
+} configSettings_t;
+
+
+/* Control for communicating with the protocol engine thread */
+
+typedef enum {          // commands sent to protocol thread
+    COMMAND_DONE,       // marks command complete
+    COMMAND_SEND,       // send a message to the message bus
+    COMMAND_IS_READY,   // is the connection to the message bus active?
+    COMMAND_SHUTDOWN    // cleanup and terminate protocol thread.
+} commands_t;
+
+
+typedef struct _threadIPC {
+    pthread_mutex_t lock;
+    pthread_cond_t condition;
+    commands_t command;
+    rsRetVal result;    // of command
+    pn_message_t *message;
+    uint64_t    tag;    // per message id
+} threadIPC_t;
+
+
+/* per-instance data */
+
+typedef struct _instanceData {
+    configSettings_t config;
+    threadIPC_t ipc;
+    int bThreadRunning;
     pthread_t thread_id;
+    pn_reactor_t *reactor;
+    pn_handler_t *handler;
+    pn_message_t *message;
+    int log_count;
 } instanceData;
 
 
-/* AMQP Glue Code */
-
-static pn_timestamp_t _now()
-{
-    struct timespec ts = {0};
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (ts.tv_sec * (pn_timestamp_t)1000) + (ts.tv_nsec/(pn_timestamp_t)1000000);
-}
-
-
-const pn_state_t ENDPOINT_ACTIVE = (PN_LOCAL_ACTIVE | PN_REMOTE_ACTIVE);
-const pn_state_t ENDPOINT_CLOSED = (PN_LOCAL_CLOSED | PN_REMOTE_CLOSED);
-const pn_state_t ENDPOINT_OPENING = (PN_LOCAL_UNINIT | PN_REMOTE_ACTIVE);
-const pn_state_t ENDPOINT_CLOSING = (PN_LOCAL_ACTIVE | PN_REMOTE_CLOSED);
-
-/* state maintained by the protocol thread */
-typedef struct {
-    pn_reactor_t *reactor;  // AMQP 1.0 protocol engine
-    pn_connection_t *conn;  // AMQP 1.0 connection
-    pn_session_t *ssn;  // on connection
-    pn_link_t *sender;  // on ssn
-    int msgs_sent;
-    int msgs_settled;
-    char *encoded_buffer;
-    size_t buffer_size;
-    bool done;
-} protocol_handler_t;
-
-
-/* access the protocol_handler_t within the pn_handler_t */
-static protocol_handler_t *_protocol_handler(pn_handler_t *handler)
-{
-  return (protocol_handler_t *) pn_handler_mem(handler);
-}
+/* glue code */
 
 typedef void dispatch_t(pn_handler_t *, pn_event_t *, pn_event_type_t);
 
-/* create and initialize a protocol_handler_t instance */
-static pn_handler_t *_new_handler(pn_reactor_t *reactor, dispatch_t *dispatcher)
-{
-  pn_handler_t *handler = pn_handler_new(dispatcher, sizeof(protocol_handler_t), NULL);
-  protocol_handler_t *th = _protocol_handler(handler);
-  th->msgs_sent = 0;
-  th->msgs_settled = 0;
-  th->done = false;
-  th->buffer_size = 64;
-  th->encoded_buffer = (char *)malloc(th->buffer_size);
-  th->reactor = reactor;
-  th->conn = NULL;
-  th->ssn = NULL;
-  th->sender = NULL;
-  return handler;
-}
-
-/* release a protocol_handler_t instance */
-static void _del_handler(pn_handler_t *handler)
-{
-  protocol_handler_t *th = _protocol_handler(handler);
-  if (th->encoded_buffer) free (th->encoded_buffer);
-  pn_decref(handler);
-}
-
-
-
-static void dispatcher(pn_handler_t *handler, pn_event_t *event, pn_event_type_t type)
-{
-    fprintf(stdout, "Event %s\n", pn_event_type_name(type));
-
-    protocol_handler_t *ph = _protocol_handler(handler);
-    switch (type) {
-    case PN_CONNECTION_INIT:
-        {
-            pn_connection_t *conn = pn_event_connection(event);
-            pn_connection_set_container(conn, "AContainerName");
-            //pn_connection_set_hostname(conn, "amqp://localhost:5672");
-            pn_connection_set_hostname(conn, "localhost:5672");
-            // TODO: version detection??
-            //pn_connection_set_user(conn, "guest");
-            //pn_connection_set_password(conn, "guest");
-            pn_connection_open(conn);
-            fprintf(stdout, "CONNECTION REFCOUNT: %d\n", pn_refcount(ph->conn));
-        }
-        break;
-    case PN_CONNECTION_REMOTE_OPEN:
-    case PN_CONNECTION_LOCAL_OPEN:
-        {
-            // if local uninit call on_connection_opening  ?? auto_open
-            // else call on_connection_opened
-            pn_connection_t *conn = pn_event_connection(event);
-            pn_state_t s = pn_connection_state(conn);
-            if (s == ENDPOINT_ACTIVE) {
-                fprintf(stdout, "CONN UP\n");
-                pn_session_t *ssn = pn_session(conn);
-                pn_session_open(ssn);
-                pn_link_t *snd = pn_sender(ssn, "sender");
-                pn_terminus_set_address(pn_link_target(snd), "amq.topic");
-                pn_terminus_set_address(pn_link_source(snd), "amq.topic");
-                pn_link_open(snd);
-            } else {
-                fprintf(stdout, "CONN STATE = 0x%X\n", s);
-            }
-        }
-        break;
-    case PN_LINK_REMOTE_OPEN:
-    case PN_LINK_LOCAL_OPEN:
-        {
-            // if local open and remote open call on_link_opened
-            // if remote open and not local call on_link_opening
-            pn_link_t *snd = pn_event_link(event);
-            pn_state_t s = pn_link_state(snd);
-            if (s == ENDPOINT_ACTIVE) {
-                fprintf(stdout, "LINK UP\n");
-            }
-            fprintf(stdout, "LINK REFCOUNT: %d\n", pn_refcount(snd));
-        }
-        break;
-
-    case PN_LINK_FLOW:
-        {
-
-        static pn_timestamp_t lasttime = 0;
-        pn_timestamp_t now = _now();
-        if (lasttime && (now - lasttime) < 10000)
-            break;
-        lasttime = now;
-        // if link is sender and credit > 0 call on_sendable
-        static uint64_t tag = 0;
-
-        pn_link_t *snd = pn_event_link(event);
-        int credit = pn_link_credit(snd);
-        fprintf(stdout, "Link credit = %d\n", credit);
-        if (credit > 0) {
-            ++tag;
-            pn_delivery(snd, pn_dtag((const char *)&tag, sizeof(tag)));
-            pn_message_t *msg = pn_message();
-            pn_data_t *body = pn_message_body(msg);
-            // TODO locking
-            pn_data_put_string(body, pn_bytes(4, "WTF?"));
-            int rc = 0;
-            size_t len = 0;
-            do {
-                len = ph->buffer_size;
-                rc = pn_message_encode(msg, ph->encoded_buffer, &len);
-                if (rc == PN_OVERFLOW) {
-                    ph->buffer_size *= 2;
-                    free(ph->encoded_buffer);
-                    ph->encoded_buffer = (char *)malloc(ph->buffer_size);
-                }
-            } while (rc == PN_OVERFLOW);
-            pn_decref(msg);
-
-            if (rc != 0) {
-                fprintf(stderr, "HANDLE THIS\n");
-                break;
-            }
-            pn_link_send(snd, ph->encoded_buffer, len);
-            pn_link_advance(snd);
-            ++ph->msgs_sent;
-        }
-    }
-        break;
-    case PN_DELIVERY: {
-        // if sender and updated, call on_accepted or on_rejected or....
-        //   and if remote settled call on_settled
-        // if recver and readable not partial:
-        //     call on_message, use return value to update delivery and settle
-        // else if recvr and updated and settled call on_settled
-        pn_link_t *snd = pn_event_link(event);
-        if (!pn_link_is_sender(snd)) {
-            fprintf(stderr, "RECEIVER???\n");
-            break;
-        }
-        pn_delivery_t *dlv = pn_event_delivery(event);
-        if (pn_delivery_updated(dlv)) {
-            uint64_t state = pn_delivery_remote_state(dlv);
-            fprintf(stdout, "remote delivery state = 0x%lX\n", state);
-            if (state != PN_RECEIVED) {
-                pn_delivery_settle(dlv);
-            }
-        }
-    }
-        break;
-    case PN_LINK_LOCAL_CLOSE:
-    case PN_LINK_REMOTE_CLOSE:
-        {
-            // if remote close check link->remote_condition and
-            //   call on_link_error if needed
-            // if local is closed, call on_link_closed
-            // else call on_link_closing()
-            /// ?? should we auto close??
-            pn_link_t *snd = pn_event_link(event);
-            pn_state_t s = pn_link_state(snd);
-            if (s == ENDPOINT_CLOSED) {
-                pn_session_t *ssn = pn_link_session(snd);
-                pn_session_close(ssn);
-                fprintf(stdout, "LINK REFCOUNT: %d\n", pn_refcount(snd));
-            } else if (s == ENDPOINT_CLOSING) {
-                // TODO error?
-                pn_link_close(snd);
-            }
-        }
-        break;
-
-    case PN_SESSION_REMOTE_CLOSE:
-    case PN_SESSION_LOCAL_CLOSE:
-        {
-            // see link
-            pn_session_t *ssn = pn_event_session(event);
-            pn_state_t s = pn_session_state(ssn);
-            if (s == ENDPOINT_CLOSED) {
-                pn_connection_t *conn = pn_session_connection(ssn);
-                pn_connection_close(conn);
-                fprintf(stdout, "SESSION REFCOUNT: %d\n", pn_refcount(ssn));
-            } else if (s == ENDPOINT_CLOSING) {
-                // TODO error?
-                pn_session_close(ssn);
-            }
-        }
-        break;
-
-    case PN_CONNECTION_REMOTE_CLOSE:
-    case PN_CONNECTION_LOCAL_CLOSE:
-        {
-            // see link
-            pn_connection_t *conn = pn_event_connection(event);
-            pn_state_t s = pn_connection_state(conn);
-            if (s == ENDPOINT_CLOSING) {
-                pn_connection_close(conn);
-                fprintf(stdout, "CONNECTION REFCOUNT: %d\n", pn_refcount(conn));
-            } else if (s == ENDPOINT_CLOSED) {
-                ph->done = true;
-            }
-        }
-        break;
-    case PN_TRANSPORT_ERROR:
-        {
-            // log
-            // if condition is fatal, close the connection
-            pn_transport_t *tport = pn_event_transport(event);
-            pn_condition_t *issue = pn_transport_condition(tport);
-            pn_connection_t *conn = pn_event_connection(event);
-            fprintf(stdout, "CONN REFCOUNT %d\n", pn_refcount(conn));
-            fprintf(stdout, "TPORT REFCOUNT %d\n", pn_refcount(tport));
-
-            if (pn_condition_is_set(issue)) {
-                fprintf(stderr, "Transport Issue:\n"
-                        "  name=%s\n"
-                        "  description=%s\n",
-                        pn_condition_get_name(issue),
-                        pn_condition_get_description(issue));
-            }
-            pn_sasl_t *sasl = pn_sasl(tport);
-            if (sasl && pn_sasl_outcome(sasl) == PN_SASL_AUTH) {
-                fprintf(stderr, "Failed authentication\n");
-            }
-            ph->done = true;            
-        }
-        
-        break;
-
-    case PN_CONNECTION_BOUND:
-        {
-            pn_connection_t *conn = pn_event_connection(event);
-            fprintf(stdout, "REFCOUNT %d\n", pn_refcount(conn));
-        }
-        break;
-
-    case PN_CONNECTION_UNBOUND:
-    {
-        pn_connection_t *conn = pn_event_connection(event);
-        fprintf(stdout, "REFCOUNT %d\n", pn_refcount(conn));
-            /* pn_transport_t *tp = pn_event_transport(event); */
-            /* if (!tp) fprintf(stdout, "WTF???"); */
-            /* pn_transport_set_idle_timeout(tp, 10*1000); */
-    }
-    break;
-
-        // transport_tail_closed
-        // if connection and connection is locally opened, call on_disconnected
-
-    case PN_TRANSPORT_CLOSED:
-        {
-            // log
-            // if condition is fatal, close the connection
-            pn_transport_t *tport = pn_event_transport(event);
-            pn_connection_t *conn = pn_event_connection(event);
-            if (conn) fprintf(stdout, "CONN REFCOUNT %d\n", pn_refcount(conn));
-            fprintf(stdout, "TPORT REFCOUNT %d\n", pn_refcount(tport));
-        }
-        break;
-
-
-    default:
-        break;
-    }
-
-}
-
-
-/* void *main(int argc, char **argv) */
-/* { */
-/*     pn_reactor_t *reactor = pn_reactor(); */
-/*     //pn_handler_t *handler = pn_reactor_get_handler(reactor); */
-/*     pn_handler_t *handler = new_handler(reactor); */
-/*     test_handler_t *th = to_handler(handler); */
-/*     //pn_handler_add(handler, th); */
-/*     pn_reactor_connection(reactor, handler); */
-/*     pn_reactor_start(reactor); */
-/*     while (!th->done) { */
-/*         fprintf(stdout, "Calling reactor run...\n"); */
-/*         bool rc = pn_reactor_process(reactor); */
-/*         fprintf(stdout, "... reactor returned %d\n", rc); */
-/*         sleep(1); */
-/*     } */
-/*     pn_reactor_stop(reactor); */
-/*     pn_reactor_free(reactor); */
-/*     free(th->encoded_buffer); */
-/*     pn_decref(handler); */
-/*     return 0; */
-/* } */
-
-
-/* runs the protocol engine, allowing it to handle TCP socket I/O and timer
- * events when actions are not being serviced.
-*/
-static void *amqp1_thread(void *arg)
-{
-    pn_reactor_t *reactor = NULL;
-    pn_handler_t *handler = NULL;
-    protocol_handler_t *ph = NULL;
-    bool stopped = false;
-
-    while (!stopped) {
-        // create the protocol engine (reactor)
-        reactor = pn_reactor();
-        handler = _new_handler(reactor, dispatcher);
-        ph = _protocol_handler(handler);
-        // setup a connection and run the engine
-        ph->conn = pn_reactor_connection(reactor, handler);
-        // TODO: is this necessary?:
-        pn_reactor_set_timeout(reactor, 5000);
-        pn_reactor_start(reactor);
-        bool engine_running = true;
-        while (engine_running) {
-            engine_running = pn_reactor_process(reactor);
-            // TODO: handle commands
-            fprintf(stdout, "Reactor returned\n");
-        }
-        fprintf(stdout, "REACTOR DEAD? %d\n",
-                (ph->conn) ? pn_refcount(ph->conn) : 0);
-        fflush(NULL);
-        ph->conn = NULL;
-        pn_reactor_stop(reactor);
-        _del_handler(handler);
-        pn_reactor_free(reactor);
-
-        // TODO reconnect backoff??
-
-    }
-    return 0;
-}
-
-
-static rsRetVal _launch_thread(instanceData *pData)
-{
-    int rc = pthread_create(&pData->thread_id, NULL, amqp1_thread, NULL);
-    if (!rc) {
-        pData->bIsRunning = true;
-        return RS_RET_OK;
-    }
-    if (rc == EAGAIN) {
-        DBGPRINTF("omamqp1: pthread_create returned EAGAIN, suspending\n");
-        return RS_RET_SUSPENDED;
-    }
-    errmsg.LogError(0, RS_RET_SYS_ERR, "omamqp1: thread create failed: %d\n", rc);
-    return RS_RET_SYS_ERR;
-}
-
-static rsRetVal _shutdown_thread(instanceData *pData)
-{
-    return RS_RET_OK;
-    // TODO set flag, wake, and join
-}
-
-
-void KAG_trace(const char *m)
-{
-    fprintf(stdout, "KAG_TRACE: %s\n", m);
-}
-
-
-
-
-
+static void _init_thread_ipc(threadIPC_t *pIPC);
+static void _clean_thread_ipc(threadIPC_t *ipc);
+static void _init_config_settings(configSettings_t *pConfig);
+static void _clean_config_settings(configSettings_t *pConfig);
+static rsRetVal _shutdown_thread(instanceData *pData);
+static rsRetVal _new_handler(pn_handler_t **handler,
+                             pn_reactor_t *reactor,
+                             dispatch_t *dispatcher,
+                             configSettings_t *config,
+                             threadIPC_t *ipc);
+static void _del_handler(pn_handler_t *handler);
+static rsRetVal _launch_protocol_thread(instanceData *pData);
+static rsRetVal _shutdown_thread(instanceData *pData);
+static rsRetVal _issue_command(threadIPC_t *ipc,
+                               pn_reactor_t *reactor,
+                               commands_t command,
+                               pn_message_t *message);
+static void dispatcher(pn_handler_t *handler,
+                       pn_event_t *event,
+                       pn_event_type_t type);
 
 
 /* tables for interfacing with the v6 config system */
@@ -489,12 +154,6 @@ static struct cnfparamblk actpblk = {
 };
 
 
-
-//BEGINinitConfVars       /* (re)set config variables to default values */
-//CODESTARTinitConfVars
-//ENDinitConfVars
-
-
 BEGINisCompatibleWithFeature
 CODESTARTisCompatibleWithFeature
 {
@@ -507,27 +166,22 @@ ENDisCompatibleWithFeature
 BEGINcreateInstance
 CODESTARTcreateInstance
 {
-    KAG_trace("create instance");
+    memset(pData, 0, sizeof(instanceData));
+    _init_config_settings(&pData->config);
+    _init_thread_ipc(&pData->ipc);
 }
 ENDcreateInstance
-
-// Set the default values for newly created Instance Data
-static void setInstDefaults(instanceData __attribute__((unused)) *pData)
-{
-    memset(pData, 0, sizeof(*pData));
-}
 
 
 BEGINfreeInstance
 CODESTARTfreeInstance
 {
     _shutdown_thread(pData);
-    if (pData->url) free(pData->url);
-    if (pData->username) free(pData->username);
-    if (pData->password) free(pData->password);
-    if (pData->target) free(pData->target);
-    if (pData->templateName) free(pData->templateName);
-    //if (pData->pn_connection) pn_connection_free(pData->pn_connection);
+    _clean_config_settings(&pData->config);
+    _clean_thread_ipc(&pData->ipc);
+    if (pData->reactor) pn_decref(pData->reactor);
+    if (pData->handler) _del_handler(pData->handler);
+    if (pData->message) pn_decref(pData->message);
 }
 ENDfreeInstance
 
@@ -535,7 +189,9 @@ ENDfreeInstance
 BEGINdbgPrintInstInfo
 CODESTARTdbgPrintInstInfo
 {
-    /* dump the instance data */
+#if 0
+
+    /* TODO: dump the instance data */
     dbgprintf("omamqp1\n");
     dbgprintf("  url=%s\n", pData->url);
     dbgprintf("  username=%s\n", pData->username);
@@ -544,51 +200,72 @@ CODESTARTdbgPrintInstInfo
     dbgprintf("  template=%s\n", pData->templateName);
     dbgprintf("  disableSASL=%d\n", pData->bDisableSASL);
     dbgprintf("  running=%d\n", pData->bIsRunning);
+#endif
 }
 ENDdbgPrintInstInfo
 
 
 BEGINtryResume
 CODESTARTtryResume
-// KAG TODO
+{
+    // is the link active?
+    iRet = _issue_command(&pData->ipc, pData->reactor, COMMAND_IS_READY, NULL);
+}
 ENDtryResume
 
 
 BEGINbeginTransaction
 CODESTARTbeginTransaction
 {
-    KAG_trace("beginTransaction");
-    if (!pData->bIsRunning) {
-        iRet = _launch_thread(pData);
-    }
-}
-ENDbeginTransaction
-
-
-BEGINendTransaction
-CODESTARTendTransaction
-{
-    KAG_trace("endTransaction");
+    pData->log_count = 0;
+    if (pData->message) pn_decref(pData->message);
+    pData->message = pn_message();
+    CHKmalloc(pData->message);
+    pn_data_t *body = pn_message_body(pData->message);
+    pn_data_put_list(body);
+    pn_data_enter(body);
 }
 finalize_it:
-ENDendTransaction
+ENDbeginTransaction
 
 
 BEGINdoAction
 CODESTARTdoAction
 {
-    KAG_trace("doAction");
-    fprintf(stdout, "LOG[%s]\n", ppString[0]);
+    pn_bytes_t msg = pn_bytes(strlen((const char *)ppString[0]),
+                              (const char *)ppString[0]);
+    assert(pData->message);
+    pn_data_t *body = pn_message_body(pData->message);
+    pn_data_put_string(body, msg);
+    pData->log_count++;
     iRet = RS_RET_DEFER_COMMIT;
 }
 ENDdoAction
 
 
+BEGINendTransaction
+CODESTARTendTransaction
+{
+    assert(pData->message);
+    pn_data_t *body = pn_message_body(pData->message);
+    pn_data_exit(body);
+    pn_message_t *message = pData->message;
+    pData->message = NULL;
+    if (pData->log_count > 0) {
+        CHKiRet(_issue_command(&pData->ipc, pData->reactor, COMMAND_SEND, message));
+    } else {
+        DBGPRINTF("omamqp1: no log messages to send\n");
+        pn_decref(message);
+    }
+}
+finalize_it:
+ENDendTransaction
 
 
 BEGINnewActInst
 struct cnfparamvals *pvals;
 int i;
+configSettings_t *cs;
 CODESTARTnewActInst
 {
     if ((pvals = nvlstGetParams(lst, &actpblk, NULL)) == NULL) {
@@ -596,7 +273,7 @@ CODESTARTnewActInst
     }
 
     CHKiRet(createInstance(&pData));
-    setInstDefaults(pData);
+    cs = &pData->config;
 
     CODE_STD_STRING_REQUESTnewActInst(1);
 
@@ -604,35 +281,36 @@ CODESTARTnewActInst
         if (!pvals[i].bUsed)
             continue;
         if (!strcmp(actpblk.descr[i].name, "url")) {
-            pData->url = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+            cs->url = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
         } else if (!strcmp(actpblk.descr[i].name, "template")) {
-            pData->templateName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+            cs->templateName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
         } else if (!strcmp(actpblk.descr[i].name, "target")) {
-            pData->target = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+            cs->target = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
         } else if (!strcmp(actpblk.descr[i].name, "username")) {
-            pData->username = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+            cs->username = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
         } else if (!strcmp(actpblk.descr[i].name, "password")) {
-            pData->password = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+            cs->password = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
         } else if (!strcmp(actpblk.descr[i].name, "disableSASL")) {
-            pData->bDisableSASL = (int) pvals[i].val.d.n;
+            cs->bDisableSASL = (int) pvals[i].val.d.n;
         } else {
+            // TODO retrydelay, idle timeout
             dbgprintf("omamqp1: program error, unrecognized param '%s', ignored.\n",
                       actpblk.descr[i].name);
         }
     }
-#if 0
-    if (pData->host == NULL) {
-        errmsg.LogError(0, RS_RET_INVALID_PARAMS, "disabled: parameter host must be specified");
-        ABORT_FINALIZE(RS_RET_INVALID_PARAMS);
-    }
-#endif
 
     CHKiRet(OMSRsetEntry(*ppOMSR,
                          0,
-                         (uchar*)strdup((pData->templateName == NULL)
+                         (uchar*)strdup((cs->templateName == NULL)
                                         ? "RSYSLOG_FileFormat"
-                                        : (char*)pData->templateName),
+                                        : (char*)cs->templateName),
                          OMSR_NO_RQD_TPL_OPTS));
+
+    // once configuration is known, start the protocol engine thread
+    pData->reactor = pn_reactor();
+    CHKmalloc(pData->reactor);
+    CHKiRet(_new_handler(&pData->handler, pData->reactor, dispatcher, &pData->config, &pData->ipc));
+    CHKiRet(_launch_protocol_thread(pData));
 }
 CODE_STD_FINALIZERnewActInst
     cnfparamvalsDestruct(pvals, &actpblk);
@@ -667,7 +345,7 @@ CODESTARTqueryEtryPt
     CODEqueryEtryPt_STD_OMOD_QUERIES
     CODEqueryEtryPt_STD_CONF2_CNFNAME_QUERIES
     CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES
-    CODEqueryEtryPt_TXIF_OMOD_QUERIES /* we support the transactional interface! */
+    CODEqueryEtryPt_TXIF_OMOD_QUERIES   /* use transaction interface */
 ENDqueryEtryPt
 
 
@@ -684,5 +362,544 @@ CODEmodInit_QueryRegCFSLineHdlr
 }
 ENDmodInit
 
+
+///////////////////////////////////////
+// All the Proton-specific glue code //
+///////////////////////////////////////
+
+
+/* state maintained by the protocol thread */
+
+typedef struct {
+    const configSettings_t *config;
+    threadIPC_t   *ipc;
+    pn_reactor_t *reactor;  // AMQP 1.0 protocol engine
+    pn_connection_t *conn;
+    pn_link_t *sender;
+    pn_delivery_t *delivery;
+    char *encode_buffer;
+    size_t buffer_size;
+    uint64_t tag;
+    int msgs_sent;
+    int msgs_settled;
+    sbool stopped;
+} protocolState_t;
+
+// protocolState_t is embedded in the engine handler
+#define PROTOCOL_STATE(eh) ((protocolState_t *) pn_handler_mem(eh))
+
+
+static void _init_config_settings(configSettings_t *pConfig)
+{
+    memset(pConfig, 0, sizeof(configSettings_t));
+    pConfig->idleTimeout = 30;
+    pConfig->retryDelay = 5;
+}
+
+
+static void _clean_config_settings(configSettings_t *pConfig)
+{
+    if (pConfig->url) free(pConfig->url);
+    if (pConfig->username) free(pConfig->username);
+    if (pConfig->password) free(pConfig->password);
+    if (pConfig->target) free(pConfig->target);
+    if (pConfig->templateName) free(pConfig->templateName);
+    memset(pConfig, 0, sizeof(configSettings_t));
+}
+
+
+static void _init_thread_ipc(threadIPC_t *pIPC)
+{
+    memset(pIPC, 0, sizeof(threadIPC_t));
+    pthread_mutex_init(&pIPC->lock, NULL);
+    pthread_cond_init(&pIPC->condition, NULL);
+    pIPC->command = COMMAND_DONE;
+    pIPC->result = RS_RET_OK;
+}
+
+static void _clean_thread_ipc(threadIPC_t *ipc)
+{
+    pthread_cond_destroy(&ipc->condition);
+    pthread_mutex_destroy(&ipc->lock);
+}
+
+
+// create a new handler for the engine and set up the protocolState
+static rsRetVal _new_handler(pn_handler_t **handler,
+                             pn_reactor_t *reactor,
+                             dispatch_t *dispatch,
+                             configSettings_t *config,
+                             threadIPC_t *ipc)
+{
+    DEFiRet;
+    *handler = pn_handler_new(dispatch, sizeof(protocolState_t), NULL);
+    CHKmalloc(*handler);
+    protocolState_t *pState = PROTOCOL_STATE(*handler);
+    memset(pState, 0, sizeof(protocolState_t));
+    pState->buffer_size = 64;  // will grow if not enough
+    pState->encode_buffer = (char *)malloc(pState->buffer_size);
+    CHKmalloc(pState->encode_buffer);
+    pState->reactor = reactor;
+    pn_incref(reactor);
+    pState->stopped = false;
+    // these are _references_, don't free them:
+    pState->config = config;
+    pState->ipc = ipc;
+
+ finalize_it:
+    RETiRet;
+}
+
+
+// in case existing buffer too small
+static rsRetVal _grow_buffer(protocolState_t *pState)
+{
+    DEFiRet;
+    pState->buffer_size *= 2;
+    free(pState->encode_buffer);
+    pState->encode_buffer = (char *)malloc(pState->buffer_size);
+    CHKmalloc(pState->encode_buffer);
+
+ finalize_it:
+    RETiRet;
+}
+
+
+/* release the pn_handler_t instance */
+static void _del_handler(pn_handler_t *handler)
+{
+    protocolState_t *pState = PROTOCOL_STATE(handler);
+    if (pState->encode_buffer) free(pState->encode_buffer);
+    if (pState->delivery) pn_delivery_settle(pState->delivery);
+    if (pState->sender) pn_decref(pState->sender);
+    if (pState->conn) pn_decref(pState->conn);
+    if (pState->reactor) pn_decref(pState->reactor);
+    pn_decref(handler);
+}
+
+
+// abort any pending send requests.  This is done if the connection to the
+// message bus drops unexpectantly.
+static void _abort_send_command(protocolState_t *ps)
+{
+    threadIPC_t *ipc = ps->ipc;
+
+    pthread_mutex_lock(&ipc->lock);
+    if (ipc->command == COMMAND_SEND) {
+        if (ps->delivery) {
+            errmsg.LogError(0, NO_ERRCODE,
+                            "omamqp1: aborted the message send in progress");
+            pn_delivery_settle(ps->delivery);
+            ps->delivery = NULL;
+        }
+        ipc->result = RS_RET_SUSPENDED;
+        ipc->command = COMMAND_DONE;
+        pthread_cond_signal(&ipc->condition);
+    }
+    pthread_mutex_unlock(&ipc->lock);
+}
+
+
+// log a protocol error received from the message bus
+static void _log_error(const char *message, pn_condition_t *cond)
+{
+    const char *name = pn_condition_get_name(cond);
+    const char *desc = pn_condition_get_description(cond);
+    errmsg.LogError(0, NO_ERRCODE,
+                    "omamqp1: %s %s:%s\n",
+                    message,
+                    (name) ? name : "<no name>",
+                    (desc) ? desc : "<no description>");
+}
+
+// link, session, connection endpoint state flags
+static const pn_state_t ENDPOINT_ACTIVE = (PN_LOCAL_ACTIVE | PN_REMOTE_ACTIVE);
+static const pn_state_t ENDPOINT_CLOSING = (PN_LOCAL_ACTIVE | PN_REMOTE_CLOSED);
+static const pn_state_t ENDPOINT_CLOSED = (PN_LOCAL_CLOSED | PN_REMOTE_CLOSED);
+
+
+/* is the link ready to send messages? */
+static sbool _is_ready(pn_link_t *link)
+{
+    return (link
+            && pn_link_state(link) == ENDPOINT_ACTIVE
+            && pn_link_credit(link) > 0);
+}
+
+
+/* Process each event emitted by the protocol engine */
+static void dispatcher(pn_handler_t *handler, pn_event_t *event, pn_event_type_t type)
+{
+    protocolState_t *ps = PROTOCOL_STATE(handler);
+
+    //DBGPRINTF("omamqp1: Event received: %s\n", pn_event_type_name(type));
+
+    switch (type) {
+
+    case PN_LINK_REMOTE_OPEN:
+        DBGPRINTF("omamqp1: Message bus opened link.\n");
+        break;
+
+    case PN_DELIVERY:
+        // has the message been delivered to the message bus?
+        if (ps->delivery) {
+            assert(ps->delivery == pn_event_delivery(event));
+            if (pn_delivery_updated(ps->delivery)) {
+                rsRetVal result = RS_RET_IDLE;
+                uint64_t rs = pn_delivery_remote_state(ps->delivery);
+                switch (rs) {
+                case PN_ACCEPTED:
+                    DBGPRINTF("omamqp1: Message ACCEPTED by message bus\n");
+                    result = RS_RET_OK;
+                    break;
+                case PN_REJECTED:
+                    errmsg.LogError(0, NO_ERRCODE,
+                                    "omamqp1: peer rejected log message, dropping");
+                    result = RS_RET_ERR;
+                    break;
+                case PN_RELEASED:
+                    DBGPRINTF("omamqp1: peer unable to accept message, suspending");
+                    result = RS_RET_SUSPENDED;
+                    break;
+                case PN_MODIFIED:
+                    if (pn_disposition_is_undeliverable(pn_delivery_remote(ps->delivery))) {
+                        errmsg.LogError(0, NO_ERRCODE,
+                                        "omamqp1: log message undeliverable, dropping");
+                        result = RS_RET_ERR;
+                    } else {
+                        DBGPRINTF("omamqp1: message modified, suspending");
+                        result = RS_RET_SUSPENDED;
+                    }
+                    break;
+                case PN_RECEIVED:
+                    // not finished yet, wait for next delivery update
+                    break;
+                default:
+                    // no other terminal states defined, so ignore anything else
+                    errmsg.LogError(0, NO_ERRCODE,
+                                    "omamqp1: unknown delivery state=0x%lX, ignoring",
+                                    (unsigned long) pn_delivery_remote_state(ps->delivery));
+                    break;
+                }
+
+                if (result != RS_RET_IDLE) {
+                    // the command is complete
+                    threadIPC_t *ipc = ps->ipc;
+                    pthread_mutex_lock(&ipc->lock);
+                    assert(ipc->command == COMMAND_SEND);
+                    ipc->result = result;
+                    ipc->command = COMMAND_DONE;
+                    pthread_cond_signal(&ipc->condition);
+                    pthread_mutex_unlock(&ipc->lock);
+                    pn_delivery_settle(ps->delivery);
+                    ps->delivery = NULL;
+                    if (result == RS_RET_ERR) {
+                        // try reconnecting to clear the error
+                        if (ps->sender) pn_link_close(ps->sender);
+                    }
+                }
+            }
+        }
+        break;
+
+    case PN_LINK_REMOTE_CLOSE:
+    case PN_LINK_LOCAL_CLOSE:
+        if (ps->sender) {
+            assert(ps->sender == pn_event_link(event));
+            pn_state_t ls = pn_link_state(ps->sender);
+            if (ls == ENDPOINT_CLOSING) {
+                DBGPRINTF("omamqp1: remote closed the link\n");
+                // check if remote signalled an error:
+                pn_condition_t *cond = pn_link_condition(ps->sender);
+                if (pn_condition_is_set(cond)) {
+                    _log_error("link failure", cond);
+                    // no recovery - reset the connection
+                    if (ps->conn) pn_connection_close(ps->conn);
+                } else {
+                    pn_link_close(ps->sender);
+                }
+            } else if (ls == ENDPOINT_CLOSED) { // done
+                DBGPRINTF("omamqp1: link closed\n");
+                // close parent:
+                pn_session_close(pn_link_session(ps->sender));
+            }
+        }
+        break;
+
+    case PN_SESSION_REMOTE_CLOSE:
+    case PN_SESSION_LOCAL_CLOSE:
+        {
+            pn_session_t *session = pn_event_session(event);
+            pn_state_t ss = pn_session_state(session);
+            if (ss == ENDPOINT_CLOSING) {
+                DBGPRINTF("omamqp1: remote closed the session\n");
+                // check if remote signalled an error:
+                pn_condition_t *cond = pn_session_condition(session);
+                if (pn_condition_is_set(cond)) {
+                    _log_error("session failure", cond);
+                    // no recovery - reset the connection
+                    if (ps->conn) pn_connection_close(ps->conn);
+                } else {
+                    pn_session_close(session);
+                }
+            } else if (ss == ENDPOINT_CLOSED) { // done
+                // close parent:
+                DBGPRINTF("omamqp1: session closed\n");
+                if (ps->conn) pn_connection_close(ps->conn);
+            }
+        }
+        break;
+
+    case PN_CONNECTION_REMOTE_CLOSE:
+    case PN_CONNECTION_LOCAL_CLOSE:
+        if (ps->conn) {
+            assert(ps->conn == pn_event_connection(event));
+            pn_state_t cs = pn_connection_state(ps->conn);
+            if (cs == ENDPOINT_CLOSING) {  // remote initiated close
+                DBGPRINTF("omamqp1: remote closed the connection\n");
+                // check if remote signalled an error:
+                pn_condition_t *cond = pn_connection_condition(ps->conn);
+                if (pn_condition_is_set(cond)) {
+                    _log_error("connection failure", cond);
+                }
+                pn_connection_close(ps->conn);
+            } else if (cs == ENDPOINT_CLOSED) {
+                DBGPRINTF("omamqp1: connection closed\n");
+                // the protocol thread will attempt to reconnect if it is not
+                // being shut down
+            }
+        }
+        break;
+
+    case PN_TRANSPORT_ERROR:
+        {
+            // TODO: if auth failure, does it make sense to retry???
+            pn_transport_t *tport = pn_event_transport(event);
+            pn_condition_t *cond = pn_transport_condition(tport);
+            if (pn_condition_is_set(cond)) {
+                _log_error("transport failure", cond);
+            }
+            errmsg.LogError(0, NO_ERRCODE,
+                            "omamqp1: network transport failed, reconnecting...");
+            // the protocol thread will attempt to reconnect if it is not
+            // being shut down
+        }
+        break;
+
+    default:
+        break;
+    }
+}
+
+
+// Send a command to the protocol thread and
+// wait for the command to complete
+static rsRetVal _issue_command(threadIPC_t *ipc,
+                               pn_reactor_t *reactor,
+                               commands_t command,
+                               pn_message_t *message)
+{
+    DEFiRet;
+
+    DBGPRINTF("omamqp1: Sending command %d to protocol thread\n", command);
+
+    pthread_mutex_lock(&ipc->lock);
+
+    if (message) {
+        assert(ipc->message == NULL);
+        ipc->message = message;
+    }
+    assert(ipc->command == COMMAND_DONE);
+    ipc->command = command;
+    pn_reactor_wakeup(reactor);
+    while (ipc->command != COMMAND_DONE) {
+        pthread_cond_wait(&ipc->condition, &ipc->lock);
+    }
+    iRet = ipc->result;
+    if (ipc->message) {
+        pn_decref(ipc->message);
+        ipc->message = NULL;
+    }
+
+    pthread_mutex_unlock(&ipc->lock);
+
+    DBGPRINTF("omamqp1: Command %d completed, status=%d\n", command, iRet);
+    RETiRet;
+}
+
+
+// check if a command needs processing
+static void _poll_command(protocolState_t *ps)
+{
+    if (ps->stopped) return;
+
+    threadIPC_t *ipc = ps->ipc;
+
+    pthread_mutex_lock(&ipc->lock);
+
+    switch (ipc->command) {
+
+    case COMMAND_SHUTDOWN:
+        DBGPRINTF("omamqp1: Protocol thread processing shutdown command\n");
+        ps->stopped = true;
+        if (ps->sender) pn_link_close(ps->sender);
+        // wait for the shutdown to complete before ack'ing this command
+        break;
+
+    case COMMAND_IS_READY:
+        DBGPRINTF("omamqp1: Protocol thread processing ready query command\n");
+        ipc->result = _is_ready(ps->sender)
+                      ? RS_RET_OK
+                      : RS_RET_SUSPENDED;
+        ipc->command = COMMAND_DONE;
+        pthread_cond_signal(&ipc->condition);
+        break;
+
+    case COMMAND_SEND:
+        if (ps->delivery) break;  // currently processing this command
+        DBGPRINTF("omamqp1: Protocol thread processing send message command\n");
+        if (!_is_ready(ps->sender)) {
+            ipc->result = RS_RET_SUSPENDED;
+            ipc->command = COMMAND_DONE;
+            pthread_cond_signal(&ipc->condition);
+            break;
+        }
+
+        // send the message
+        ++ps->tag;
+        ps->delivery = pn_delivery(ps->sender,
+                                   pn_dtag((const char *)&ps->tag, sizeof(ps->tag)));
+        pn_message_t *message = ipc->message;
+        assert(message);
+
+        int rc = 0;
+        size_t len = ps->buffer_size;
+        do {
+            rc = pn_message_encode(message, ps->encode_buffer, &len);
+            if (rc == PN_OVERFLOW) {
+                _grow_buffer(ps);
+                len = ps->buffer_size;
+            }
+        } while (rc == PN_OVERFLOW);
+
+        pn_link_send(ps->sender, ps->encode_buffer, len);
+        pn_link_advance(ps->sender);
+        ++ps->msgs_sent;
+        // command completes when remote updates the delivery (see PN_DELIVERY)
+        break;
+
+    case COMMAND_DONE:
+        break;
+    }
+
+    pthread_mutex_unlock(&ipc->lock);
+}
+
+/* runs the protocol engine, allowing it to handle TCP socket I/O and timer
+ * events in the background.
+*/
+static void *amqp1_thread(void *arg)
+{
+    DBGPRINTF("omamqp1: Protocol thread started\n");
+
+    pn_handler_t *handler = (pn_handler_t *)arg;
+    protocolState_t *ps = PROTOCOL_STATE(handler);
+
+    // TODO: timeout necessary??
+    pn_reactor_set_timeout(ps->reactor, 5000);
+    pn_reactor_start(ps->reactor);
+
+    while (!ps->stopped) {
+        // setup a connection:
+        ps->conn = pn_reactor_connection(ps->reactor, handler);
+        pn_incref(ps->conn);
+        // TODO: properly configure using action configuration:
+        pn_connection_set_container(ps->conn, "AContainerName");
+        pn_connection_set_hostname(ps->conn, "localhost:5672");
+        // TODO: version detection??
+        //pn_connection_set_user(conn, "guest");
+        //pn_connection_set_password(conn, "guest");
+        pn_connection_open(ps->conn);
+        pn_session_t *ssn = pn_session(ps->conn);
+        pn_session_open(ssn);
+        ps->sender = pn_sender(ssn, "rsyslogd-omamqp1");
+        pn_link_set_snd_settle_mode(ps->sender, PN_SND_UNSETTLED);
+        char *addr = (char *)ps->config->target;
+        pn_terminus_set_address(pn_link_target(ps->sender), addr);
+        pn_terminus_set_address(pn_link_source(ps->sender), addr);
+        pn_link_open(ps->sender);
+
+        // run the protocol engine until the connection closes or thread is shut down
+        sbool engine_running = true;
+        while (engine_running) {
+            engine_running = pn_reactor_process(ps->reactor);
+            _poll_command(ps);
+        }
+
+        DBGPRINTF("omamqp1: reactor finished\n");
+
+        _abort_send_command(ps);   // if the connection dropped while sending
+        pn_decref(ps->sender);
+        ps->sender = NULL;
+        pn_decref(ps->conn);
+        ps->conn = NULL;
+
+        // delay retryDelay seconds before re-connecting:
+        int delay = ps->config->retryDelay;
+        while (delay-- > 0 && !ps->stopped) {
+            srSleep(1, 0);
+            _poll_command(ps);
+        }
+    }
+    pn_reactor_stop(ps->reactor);
+
+    // stop command is now done:
+    threadIPC_t *ipc = ps->ipc;
+    pthread_mutex_lock(&ipc->lock);
+    ipc->result = RS_RET_OK;
+    ipc->command = COMMAND_DONE;
+    pthread_cond_signal(&ipc->condition);
+    pthread_mutex_unlock(&ipc->lock);
+
+    DBGPRINTF("omamqp1: Protocol thread stopped\n");
+
+    return 0;
+}
+
+
+static rsRetVal _launch_protocol_thread(instanceData *pData)
+{
+    int rc;
+    DBGPRINTF("omamqp1: Starting protocol thread\n");
+    do {
+        rc = pthread_create(&pData->thread_id, NULL, amqp1_thread, pData->handler);
+        if (!rc) {
+            pData->bThreadRunning = true;
+            return RS_RET_OK;
+        }
+    } while (rc == EAGAIN);
+    errmsg.LogError(0, RS_RET_SYS_ERR, "omamqp1: thread create failed: %d\n", rc);
+    return RS_RET_SYS_ERR;
+}
+
+static rsRetVal _shutdown_thread(instanceData *pData)
+{
+    DEFiRet;
+
+    if (pData->bThreadRunning) {
+        DBGPRINTF("omamqp1: shutting down thread...\n");
+        CHKiRet(_issue_command(&pData->ipc, pData->reactor, COMMAND_SHUTDOWN, NULL));
+        pthread_join(pData->thread_id, NULL);
+        pData->bThreadRunning = false;
+        DBGPRINTF("omamqp1: thread shutdown complete\n");
+    }
+
+ finalize_it:
+    RETiRet;
+}
+
+
+
 /* vi:set ai:
  */
+
