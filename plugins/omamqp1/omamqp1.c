@@ -823,8 +823,8 @@ static void *amqp1_thread(void *arg)
 #if PN_VERSION_MAJOR == 0 && PN_VERSION_MINOR >= 10
         // proton version <= 0.9 did not support Cyrus SASL
         if (cfg->username && cfg->password) {
-            pn_connection_set_user(ps->conn, cfg->username);
-            pn_connection_set_password(ps->conn, cfg->password);
+	    pn_connection_set_user(ps->conn, (char *)cfg->username);
+	    pn_connection_set_password(ps->conn, (char *)cfg->password);
         }
 #endif
         pn_connection_open(ps->conn);
