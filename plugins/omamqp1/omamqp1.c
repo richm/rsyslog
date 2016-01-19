@@ -51,6 +51,7 @@
 #include <proton/message.h>
 #include <proton/transport.h>
 #include <proton/sasl.h>
+#include <proton/version.h>
 
 
 MODULE_TYPE_OUTPUT
@@ -66,7 +67,7 @@ DEFobjCurrIf(errmsg)
 
 /* Settings for the action */
 typedef struct _configSettings {
-    uchar *url;         /* address of message bus */
+    uchar *host;         /* address of message bus */
     uchar *username;    /* authentication credentials */
     uchar *password;
     uchar *target;      /* endpoint for sent log messages */
@@ -140,7 +141,7 @@ static void dispatcher(pn_handler_t *handler,
 /* tables for interfacing with the v6 config system */
 /* action (instance) parameters */
 static struct cnfparamdescr actpdescr[] = {
-    { "url", eCmdHdlrGetWord, CNFPARAM_REQUIRED },
+    { "host", eCmdHdlrGetWord, CNFPARAM_REQUIRED },
     { "target", eCmdHdlrGetWord, CNFPARAM_REQUIRED },
     { "username", eCmdHdlrGetWord, 0 },
     { "password", eCmdHdlrGetWord, 0 },
@@ -193,7 +194,7 @@ CODESTARTdbgPrintInstInfo
 
     /* TODO: dump the instance data */
     dbgprintf("omamqp1\n");
-    dbgprintf("  url=%s\n", pData->url);
+    dbgprintf("  host=%s\n", pData->host);
     dbgprintf("  username=%s\n", pData->username);
     //dbgprintf("  password=%s", pData->password);
     dbgprintf("  target=%s\n", pData->target);
@@ -280,8 +281,8 @@ CODESTARTnewActInst
     for(i = 0 ; i < actpblk.nParams ; ++i) {
         if (!pvals[i].bUsed)
             continue;
-        if (!strcmp(actpblk.descr[i].name, "url")) {
-            cs->url = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+        if (!strcmp(actpblk.descr[i].name, "host")) {
+            cs->host = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
         } else if (!strcmp(actpblk.descr[i].name, "template")) {
             cs->templateName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
         } else if (!strcmp(actpblk.descr[i].name, "target")) {
@@ -325,7 +326,7 @@ CODESTARTparseSelectorAct
         errmsg.LogError(0, RS_RET_LEGA_ACT_NOT_SUPPORTED,
                         "omamqp1 only supports the V6 configuration format."
                         " Example:\n"
-                        " action(type=\"omamqp1.py\" url=<URL> target=<TARGET> ...)");
+                        " action(type=\"omamqp1.py\" host=<address[:port]> target=<TARGET> ...)");
         ABORT_FINALIZE(RS_RET_CONFLINE_UNPROCESSED);
     }
 }
@@ -399,7 +400,7 @@ static void _init_config_settings(configSettings_t *pConfig)
 
 static void _clean_config_settings(configSettings_t *pConfig)
 {
-    if (pConfig->url) free(pConfig->url);
+    if (pConfig->host) free(pConfig->host);
     if (pConfig->username) free(pConfig->username);
     if (pConfig->password) free(pConfig->password);
     if (pConfig->target) free(pConfig->target);
@@ -804,6 +805,7 @@ static void *amqp1_thread(void *arg)
 
     pn_handler_t *handler = (pn_handler_t *)arg;
     protocolState_t *ps = PROTOCOL_STATE(handler);
+    const configSettings_t *cfg = ps->config;
 
     // TODO: timeout necessary??
     pn_reactor_set_timeout(ps->reactor, 5000);
@@ -813,16 +815,24 @@ static void *amqp1_thread(void *arg)
         // setup a connection:
         ps->conn = pn_reactor_connection(ps->reactor, handler);
         pn_incref(ps->conn);
-        // TODO: properly configure using action configuration:
-        pn_connection_set_container(ps->conn, "AContainerName");
-        pn_connection_set_hostname(ps->conn, "localhost:5672");
-        // TODO: version detection??
-        //pn_connection_set_user(conn, "guest");
-        //pn_connection_set_password(conn, "guest");
+        pn_connection_set_container(ps->conn, "rsyslogd-omamqp1");
+        pn_connection_set_hostname(ps->conn, (cfg->host
+                                              ? (char *)cfg->host
+                                              : "localhost:5672"));
+
+#if PN_VERSION_MAJOR == 0 && PN_VERSION_MINOR >= 10
+        // proton version <= 0.9 did not support Cyrus SASL
+        if (cfg->username && cfg->password) {
+            pn_connection_set_user(ps->conn, cfg->username);
+            pn_connection_set_password(ps->conn, cfg->password);
+        }
+#endif
         pn_connection_open(ps->conn);
         pn_session_t *ssn = pn_session(ps->conn);
         pn_session_open(ssn);
-        ps->sender = pn_sender(ssn, "rsyslogd-omamqp1");
+        ps->sender = pn_sender(ssn, (cfg->target
+                                     ? (char *) cfg->target
+                                     : "rsyslogd-omamqp1"));
         pn_link_set_snd_settle_mode(ps->sender, PN_SND_UNSETTLED);
         char *addr = (char *)ps->config->target;
         pn_terminus_set_address(pn_link_target(ps->sender), addr);
