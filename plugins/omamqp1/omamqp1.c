@@ -51,6 +51,7 @@
 #include <proton/message.h>
 #include <proton/transport.h>
 #include <proton/sasl.h>
+#include <proton/url.h>
 #include <proton/version.h>
 
 
@@ -67,7 +68,7 @@ DEFobjCurrIf(errmsg)
 
 /* Settings for the action */
 typedef struct _configSettings {
-    uchar *host;         /* address of message bus */
+    pn_url_t *url;      /* address of message bus */
     uchar *username;    /* authentication credentials */
     uchar *password;
     uchar *target;      /* endpoint for sent log messages */
@@ -146,6 +147,8 @@ static struct cnfparamdescr actpdescr[] = {
     { "username", eCmdHdlrGetWord, 0 },
     { "password", eCmdHdlrGetWord, 0 },
     { "template", eCmdHdlrGetWord, 0 },
+    { "idleTimeout", eCmdHdlrNonNegInt, 0 },
+    { "retryDelay", eCmdHdlrPositiveInt, 0 },
     { "disableSASL", eCmdHdlrInt, 0 }
 };
 static struct cnfparamblk actpblk = {
@@ -194,7 +197,7 @@ CODESTARTdbgPrintInstInfo
 
     /* TODO: dump the instance data */
     dbgprintf("omamqp1\n");
-    dbgprintf("  host=%s\n", pData->host);
+    dbgprintf("  host=%s\n", pn_url_str(pData->url));
     dbgprintf("  username=%s\n", pData->username);
     //dbgprintf("  password=%s", pData->password);
     dbgprintf("  target=%s\n", pData->target);
@@ -282,7 +285,14 @@ CODESTARTnewActInst
         if (!pvals[i].bUsed)
             continue;
         if (!strcmp(actpblk.descr[i].name, "host")) {
-            cs->host = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+            char *u = es_str2cstr(pvals[i].val.d.estr, NULL);
+            cs->url = pn_url_parse(u);
+            if (!cs->url) {
+                errmsg.LogError(0, RS_RET_CONF_PARSE_ERROR, "omamqp1: Invalid host URL configured: '%s'\n", u);
+                free(u);
+                ABORT_FINALIZE(RS_RET_CONF_PARSE_ERROR);
+            }
+            free(u);
         } else if (!strcmp(actpblk.descr[i].name, "template")) {
             cs->templateName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
         } else if (!strcmp(actpblk.descr[i].name, "target")) {
@@ -291,6 +301,10 @@ CODESTARTnewActInst
             cs->username = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
         } else if (!strcmp(actpblk.descr[i].name, "password")) {
             cs->password = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+        } else if (!strcmp(actpblk.descr[i].name, "retryDelay")) {
+            cs->retryDelay = (int) pvals[i].val.d.n;
+        } else if (!strcmp(actpblk.descr[i].name, "idleTimeout")) {
+            cs->idleTimeout = (int) pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "disableSASL")) {
             cs->bDisableSASL = (int) pvals[i].val.d.n;
         } else {
@@ -393,14 +407,13 @@ typedef struct {
 static void _init_config_settings(configSettings_t *pConfig)
 {
     memset(pConfig, 0, sizeof(configSettings_t));
-    pConfig->idleTimeout = 30;
     pConfig->retryDelay = 5;
 }
 
 
 static void _clean_config_settings(configSettings_t *pConfig)
 {
-    if (pConfig->host) free(pConfig->host);
+    if (pConfig->url) pn_url_free(pConfig->url);
     if (pConfig->username) free(pConfig->username);
     if (pConfig->password) free(pConfig->password);
     if (pConfig->target) free(pConfig->target);
@@ -542,6 +555,7 @@ static sbool _is_ready(pn_link_t *link)
 static void dispatcher(pn_handler_t *handler, pn_event_t *event, pn_event_type_t type)
 {
     protocolState_t *ps = PROTOCOL_STATE(handler);
+    const configSettings_t *cfg = ps->config;
 
     //DBGPRINTF("omamqp1: Event received: %s\n", pn_event_type_name(type));
 
@@ -606,13 +620,38 @@ static void dispatcher(pn_handler_t *handler, pn_event_t *event, pn_event_type_t
                     ps->delivery = NULL;
                     if (result == RS_RET_ERR) {
                         // try reconnecting to clear the error
-		      _close_connection(ps);
+                      _close_connection(ps);
                     }
                 }
             }
         }
         break;
 
+
+    case PN_CONNECTION_BOUND:
+        if (!cfg->bDisableSASL) {
+            // force use of SASL, even allowing PLAIN authentication
+            pn_sasl_t *sasl = pn_sasl(pn_event_transport(event));
+#if PN_VERSION_MAJOR == 0 && PN_VERSION_MINOR >= 10
+            pn_sasl_set_allow_insecure_mechs(sasl, true);
+#else
+            // proton version <= 0.9 only supports PLAIN authentication
+            const char *user = cfg->username
+                ? (char *)cfg->username
+                : pn_url_get_username(cfg->url);
+            if (user) {
+                pn_sasl_plain(sasl, user, (cfg->password
+                                           ? (char *) cfg->password
+                                           : pn_url_get_password(cfg->url)));
+            }
+#endif
+        }
+        if (cfg->idleTimeout) {
+            // configured as seconds, set as milliseconds
+            pn_transport_set_idle_timeout(pn_event_transport(event),
+                                          cfg->idleTimeout * 1000);
+        }
+        break;
 
     case PN_CONNECTION_UNBOUND:
         DBGPRINTF("omamqp1: cleaning up connection resources");
@@ -694,7 +733,7 @@ static void _poll_command(protocolState_t *ps)
     case COMMAND_SHUTDOWN:
         DBGPRINTF("omamqp1: Protocol thread processing shutdown command\n");
         ps->stopped = true;
-	_close_connection(ps);
+        _close_connection(ps);
         // wait for the shutdown to complete before ack'ing this command
         break;
 
@@ -758,7 +797,7 @@ static void *amqp1_thread(void *arg)
     protocolState_t *ps = PROTOCOL_STATE(handler);
     const configSettings_t *cfg = ps->config;
 
-    // TODO: timeout necessary??
+    // have pn_reactor_process() exit after 5 sec to poll for commands
     pn_reactor_set_timeout(ps->reactor, 5000);
     pn_reactor_start(ps->reactor);
 
@@ -766,23 +805,26 @@ static void *amqp1_thread(void *arg)
         // setup a connection:
         ps->conn = pn_reactor_connection(ps->reactor, handler);
         pn_connection_set_container(ps->conn, "rsyslogd-omamqp1");
-        pn_connection_set_hostname(ps->conn, (cfg->host
-                                              ? (char *)cfg->host
-                                              : "localhost:5672"));
+        pn_connection_set_hostname(ps->conn, pn_url_get_host(cfg->url));
 
 #if PN_VERSION_MAJOR == 0 && PN_VERSION_MINOR >= 10
         // proton version <= 0.9 did not support Cyrus SASL
-        if (cfg->username && cfg->password) {
-            pn_connection_set_user(ps->conn, (char *)cfg->username);
-            pn_connection_set_password(ps->conn, (char *)cfg->password);
-        }
+        const char *user = cfg->username
+            ? (char *)cfg->username
+            : pn_url_get_username(cfg->url);
+        if (user)
+            pn_connection_set_user(ps->conn, user);
+
+        const char *pword = cfg->password
+            ? (char *) config->password
+            : pn_url_get_password(url);
+        if (pword)
+            pn_connection_set_password(ps->conn, pword);
 #endif
         pn_connection_open(ps->conn);
         pn_session_t *ssn = pn_session(ps->conn);
         pn_session_open(ssn);
-        ps->sender = pn_sender(ssn, (cfg->target
-                                     ? (char *) cfg->target
-                                     : "rsyslogd-omamqp1"));
+        ps->sender = pn_sender(ssn, (char *)cfg->target);
         pn_link_set_snd_settle_mode(ps->sender, PN_SND_UNSETTLED);
         char *addr = (char *)ps->config->target;
         pn_terminus_set_address(pn_link_target(ps->sender), addr);

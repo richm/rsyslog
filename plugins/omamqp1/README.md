@@ -34,8 +34,19 @@ Example:
 
 The following parameters are recognized by the plugin:
 
-* template - Template used by the action.
-* host - The address of the message bus.  Optionally a port can be included, separated by a ':'.  Default: "localhost:5672"
-* target - The destination for the generated messages.  This can be the name of a queue or topic.  Default: "rsyslog-omamqp1"
+* host - The address of the message bus.  Optionally a port can be
+  included, separated by a ':'.  Example: "localhost:5672"
+* target - The destination for the generated messages.  This can be
+  the name of a queue or topic.  On some messages buses it may be
+  necessary to create this target manually.  Example: "amq.topic"
 * username - Optional.  Used by SASL to authenticate with the message bus.
 * password - Optional.  Used by SASL to authenticate with the message bus.
+* template - Template used by the action.
+* idleTimeout - The idle timeout in seconds.  This enables connection
+  heartbeats and is used to detect a failed connection to the message
+  bus.  Set to zero to disable.
+* retryDelay - The time in seconds this plugin will delay before
+  attempting to re-established a failed connection (default 5
+  seconds).
+* disableSASL - Setting this to a non-zero value will disable SASL
+  negotiation.  Only necessary if the message bus does not offer SASL.
