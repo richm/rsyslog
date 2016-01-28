@@ -181,7 +181,7 @@ CODESTARTfreeInstance
     _clean_config_settings(&pData->config);
     _clean_thread_ipc(&pData->ipc);
     if (pData->reactor) pn_decref(pData->reactor);
-    if (pData->handler) _del_handler(pData->handler);
+    if (pData->handler) pn_decref(pData->handler);
     if (pData->message) pn_decref(pData->message);
 }
 ENDfreeInstance
@@ -433,15 +433,15 @@ static rsRetVal _new_handler(pn_handler_t **handler,
                              threadIPC_t *ipc)
 {
     DEFiRet;
-    *handler = pn_handler_new(dispatch, sizeof(protocolState_t), NULL);
+    *handler = pn_handler_new(dispatch, sizeof(protocolState_t), _del_handler);
     CHKmalloc(*handler);
+    pn_handler_add(*handler, pn_handshaker());
     protocolState_t *pState = PROTOCOL_STATE(*handler);
     memset(pState, 0, sizeof(protocolState_t));
     pState->buffer_size = 64;  // will grow if not enough
     pState->encode_buffer = (char *)malloc(pState->buffer_size);
     CHKmalloc(pState->encode_buffer);
     pState->reactor = reactor;
-    pn_incref(reactor);
     pState->stopped = false;
     // these are _references_, don't free them:
     pState->config = config;
@@ -466,36 +466,45 @@ static rsRetVal _grow_buffer(protocolState_t *pState)
 }
 
 
-/* release the pn_handler_t instance */
+/* release the pn_handler_t instance. Do not call this directly,
+ * it will be called by the reactor when all references to the
+ * handler have been released.
+ */
 static void _del_handler(pn_handler_t *handler)
 {
     protocolState_t *pState = PROTOCOL_STATE(handler);
     if (pState->encode_buffer) free(pState->encode_buffer);
-    if (pState->delivery) pn_delivery_settle(pState->delivery);
-    if (pState->sender) pn_decref(pState->sender);
-    if (pState->conn) pn_decref(pState->conn);
-    if (pState->reactor) pn_decref(pState->reactor);
-    pn_decref(handler);
 }
 
 
-// abort any pending send requests.  This is done if the connection to the
-// message bus drops unexpectantly.
-static void _abort_send_command(protocolState_t *ps)
+// Close the sender and its parent session and connection
+static void _close_connection(protocolState_t *ps)
+{
+  if (ps->sender) {
+      pn_link_close(ps->sender);
+      pn_session_close(pn_link_session(ps->sender));
+  }
+  if (ps->conn) pn_connection_close(ps->conn);
+}
+
+static void _abort_command(protocolState_t *ps)
 {
     threadIPC_t *ipc = ps->ipc;
 
     pthread_mutex_lock(&ipc->lock);
-    if (ipc->command == COMMAND_SEND) {
-        if (ps->delivery) {
-            errmsg.LogError(0, NO_ERRCODE,
-                            "omamqp1: aborted the message send in progress");
-            pn_delivery_settle(ps->delivery);
-            ps->delivery = NULL;
-        }
-        ipc->result = RS_RET_SUSPENDED;
-        ipc->command = COMMAND_DONE;
-        pthread_cond_signal(&ipc->condition);
+    switch (ipc->command) {
+    case COMMAND_SEND:
+      errmsg.LogError(0, NO_ERRCODE,
+                      "omamqp1: aborted the message send in progress");
+      // fallthrough:
+    case COMMAND_IS_READY:
+      ipc->result = RS_RET_SUSPENDED;
+      ipc->command = COMMAND_DONE;
+      pthread_cond_signal(&ipc->condition);
+      break;
+    case COMMAND_SHUTDOWN: // cannot be aborted
+    case COMMAND_DONE:
+      break;
     }
     pthread_mutex_unlock(&ipc->lock);
 }
@@ -512,6 +521,7 @@ static void _log_error(const char *message, pn_condition_t *cond)
                     (name) ? name : "<no name>",
                     (desc) ? desc : "<no description>");
 }
+
 
 // link, session, connection endpoint state flags
 static const pn_state_t ENDPOINT_ACTIVE = (PN_LOCAL_ACTIVE | PN_REMOTE_ACTIVE);
@@ -596,81 +606,22 @@ static void dispatcher(pn_handler_t *handler, pn_event_t *event, pn_event_type_t
                     ps->delivery = NULL;
                     if (result == RS_RET_ERR) {
                         // try reconnecting to clear the error
-                        if (ps->sender) pn_link_close(ps->sender);
+		      _close_connection(ps);
                     }
                 }
             }
         }
         break;
 
-    case PN_LINK_REMOTE_CLOSE:
-    case PN_LINK_LOCAL_CLOSE:
-        if (ps->sender) {
-            assert(ps->sender == pn_event_link(event));
-            pn_state_t ls = pn_link_state(ps->sender);
-            if (ls == ENDPOINT_CLOSING) {
-                DBGPRINTF("omamqp1: remote closed the link\n");
-                // check if remote signalled an error:
-                pn_condition_t *cond = pn_link_condition(ps->sender);
-                if (pn_condition_is_set(cond)) {
-                    _log_error("link failure", cond);
-                    // no recovery - reset the connection
-                    if (ps->conn) pn_connection_close(ps->conn);
-                } else {
-                    pn_link_close(ps->sender);
-                }
-            } else if (ls == ENDPOINT_CLOSED) { // done
-                DBGPRINTF("omamqp1: link closed\n");
-                // close parent:
-                pn_session_close(pn_link_session(ps->sender));
-            }
-        }
+
+    case PN_CONNECTION_UNBOUND:
+        DBGPRINTF("omamqp1: cleaning up connection resources");
+        pn_connection_release(pn_event_connection(event));
+        ps->conn = NULL;
+        ps->sender = NULL;
+        ps->delivery = NULL;
         break;
 
-    case PN_SESSION_REMOTE_CLOSE:
-    case PN_SESSION_LOCAL_CLOSE:
-        {
-            pn_session_t *session = pn_event_session(event);
-            pn_state_t ss = pn_session_state(session);
-            if (ss == ENDPOINT_CLOSING) {
-                DBGPRINTF("omamqp1: remote closed the session\n");
-                // check if remote signalled an error:
-                pn_condition_t *cond = pn_session_condition(session);
-                if (pn_condition_is_set(cond)) {
-                    _log_error("session failure", cond);
-                    // no recovery - reset the connection
-                    if (ps->conn) pn_connection_close(ps->conn);
-                } else {
-                    pn_session_close(session);
-                }
-            } else if (ss == ENDPOINT_CLOSED) { // done
-                // close parent:
-                DBGPRINTF("omamqp1: session closed\n");
-                if (ps->conn) pn_connection_close(ps->conn);
-            }
-        }
-        break;
-
-    case PN_CONNECTION_REMOTE_CLOSE:
-    case PN_CONNECTION_LOCAL_CLOSE:
-        if (ps->conn) {
-            assert(ps->conn == pn_event_connection(event));
-            pn_state_t cs = pn_connection_state(ps->conn);
-            if (cs == ENDPOINT_CLOSING) {  // remote initiated close
-                DBGPRINTF("omamqp1: remote closed the connection\n");
-                // check if remote signalled an error:
-                pn_condition_t *cond = pn_connection_condition(ps->conn);
-                if (pn_condition_is_set(cond)) {
-                    _log_error("connection failure", cond);
-                }
-                pn_connection_close(ps->conn);
-            } else if (cs == ENDPOINT_CLOSED) {
-                DBGPRINTF("omamqp1: connection closed\n");
-                // the protocol thread will attempt to reconnect if it is not
-                // being shut down
-            }
-        }
-        break;
 
     case PN_TRANSPORT_ERROR:
         {
@@ -743,7 +694,7 @@ static void _poll_command(protocolState_t *ps)
     case COMMAND_SHUTDOWN:
         DBGPRINTF("omamqp1: Protocol thread processing shutdown command\n");
         ps->stopped = true;
-        if (ps->sender) pn_link_close(ps->sender);
+	_close_connection(ps);
         // wait for the shutdown to complete before ack'ing this command
         break;
 
@@ -814,7 +765,6 @@ static void *amqp1_thread(void *arg)
     while (!ps->stopped) {
         // setup a connection:
         ps->conn = pn_reactor_connection(ps->reactor, handler);
-        pn_incref(ps->conn);
         pn_connection_set_container(ps->conn, "rsyslogd-omamqp1");
         pn_connection_set_hostname(ps->conn, (cfg->host
                                               ? (char *)cfg->host
@@ -823,8 +773,8 @@ static void *amqp1_thread(void *arg)
 #if PN_VERSION_MAJOR == 0 && PN_VERSION_MINOR >= 10
         // proton version <= 0.9 did not support Cyrus SASL
         if (cfg->username && cfg->password) {
-	    pn_connection_set_user(ps->conn, (char *)cfg->username);
-	    pn_connection_set_password(ps->conn, (char *)cfg->password);
+            pn_connection_set_user(ps->conn, (char *)cfg->username);
+            pn_connection_set_password(ps->conn, (char *)cfg->password);
         }
 #endif
         pn_connection_open(ps->conn);
@@ -848,11 +798,7 @@ static void *amqp1_thread(void *arg)
 
         DBGPRINTF("omamqp1: reactor finished\n");
 
-        _abort_send_command(ps);   // if the connection dropped while sending
-        pn_decref(ps->sender);
-        ps->sender = NULL;
-        pn_decref(ps->conn);
-        ps->conn = NULL;
+        _abort_command(ps);   // unblock main thread if necessary
 
         // delay retryDelay seconds before re-connecting:
         int delay = ps->config->retryDelay;
