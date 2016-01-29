@@ -75,7 +75,8 @@ typedef struct _configSettings {
     uchar *templateName;
     int bDisableSASL;   /* do not enable SASL? 0-enable 1-disable */
     int idleTimeout;    /* disconnect idle connection (seconds) */
-    int retryDelay;     /* pause before re-connecting (seconds) */
+    int reconnectDelay; /* pause before re-connecting (seconds) */
+    int maxRetries;   /* drop unrouteable messages after maxRetries attempts */
 } configSettings_t;
 
 
@@ -148,7 +149,8 @@ static struct cnfparamdescr actpdescr[] = {
     { "password", eCmdHdlrGetWord, 0 },
     { "template", eCmdHdlrGetWord, 0 },
     { "idleTimeout", eCmdHdlrNonNegInt, 0 },
-    { "retryDelay", eCmdHdlrPositiveInt, 0 },
+    { "reconnectDelay", eCmdHdlrPositiveInt, 0 },
+    { "maxRetries", eCmdHdlrNonNegInt, 0 },
     { "disableSASL", eCmdHdlrInt, 0 }
 };
 static struct cnfparamblk actpblk = {
@@ -193,18 +195,18 @@ ENDfreeInstance
 BEGINdbgPrintInstInfo
 CODESTARTdbgPrintInstInfo
 {
-#if 0
-
-    /* TODO: dump the instance data */
-    dbgprintf("omamqp1\n");
-    dbgprintf("  host=%s\n", pn_url_str(pData->url));
-    dbgprintf("  username=%s\n", pData->username);
-    //dbgprintf("  password=%s", pData->password);
-    dbgprintf("  target=%s\n", pData->target);
-    dbgprintf("  template=%s\n", pData->templateName);
-    dbgprintf("  disableSASL=%d\n", pData->bDisableSASL);
-    dbgprintf("  running=%d\n", pData->bIsRunning);
-#endif
+    configSettings_t *cfg = &pData->config;
+    dbgprintf("omamqp1:\n");
+    dbgprintf("  host=%s\n", pn_url_str(cfg->url));
+    dbgprintf("  username=%s\n", cfg->username);
+    //dbgprintf("  password=%s\n", pData->password);
+    dbgprintf("  target=%s\n", cfg->target);
+    dbgprintf("  template=%s\n", cfg->templateName);
+    dbgprintf("  disableSASL=%d\n", cfg->bDisableSASL);
+    dbgprintf("  idleTimeout=%d\n", cfg->idleTimeout);
+    dbgprintf("  reconnectDelay=%d\n", cfg->reconnectDelay);
+    dbgprintf("  maxRetries=%d\n", cfg->maxRetries);
+    dbgprintf("  running=%d\n", pData->bThreadRunning);
 }
 ENDdbgPrintInstInfo
 
@@ -221,6 +223,7 @@ ENDtryResume
 BEGINbeginTransaction
 CODESTARTbeginTransaction
 {
+    DBGPRINTF("omamqp1: beginTransaction\n");
     pData->log_count = 0;
     if (pData->message) pn_decref(pData->message);
     pData->message = pn_message();
@@ -236,21 +239,24 @@ ENDbeginTransaction
 BEGINdoAction
 CODESTARTdoAction
 {
+    DBGPRINTF("omamqp1: doAction\n");
+    if (!pData->message) ABORT_FINALIZE(RS_RET_OK);
     pn_bytes_t msg = pn_bytes(strlen((const char *)ppString[0]),
                               (const char *)ppString[0]);
-    assert(pData->message);
     pn_data_t *body = pn_message_body(pData->message);
     pn_data_put_string(body, msg);
     pData->log_count++;
     iRet = RS_RET_DEFER_COMMIT;
 }
+finalize_it:
 ENDdoAction
 
 
 BEGINendTransaction
 CODESTARTendTransaction
 {
-    assert(pData->message);
+    DBGPRINTF("omamqp1: endTransaction\n");
+    if (!pData->message) ABORT_FINALIZE(RS_RET_OK);
     pn_data_t *body = pn_message_body(pData->message);
     pn_data_exit(body);
     pn_message_t *message = pData->message;
@@ -288,7 +294,7 @@ CODESTARTnewActInst
             char *u = es_str2cstr(pvals[i].val.d.estr, NULL);
             cs->url = pn_url_parse(u);
             if (!cs->url) {
-                errmsg.LogError(0, RS_RET_CONF_PARSE_ERROR, "omamqp1: Invalid host URL configured: '%s'\n", u);
+                errmsg.LogError(0, RS_RET_CONF_PARSE_ERROR, "omamqp1: Invalid host URL configured: '%s'", u);
                 free(u);
                 ABORT_FINALIZE(RS_RET_CONF_PARSE_ERROR);
             }
@@ -301,14 +307,15 @@ CODESTARTnewActInst
             cs->username = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
         } else if (!strcmp(actpblk.descr[i].name, "password")) {
             cs->password = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-        } else if (!strcmp(actpblk.descr[i].name, "retryDelay")) {
-            cs->retryDelay = (int) pvals[i].val.d.n;
+        } else if (!strcmp(actpblk.descr[i].name, "reconnectDelay")) {
+            cs->reconnectDelay = (int) pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "idleTimeout")) {
             cs->idleTimeout = (int) pvals[i].val.d.n;
+        } else if (!strcmp(actpblk.descr[i].name, "maxRetries")) {
+            cs->maxRetries = (int) pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "disableSASL")) {
             cs->bDisableSASL = (int) pvals[i].val.d.n;
         } else {
-            // TODO retrydelay, idle timeout
             dbgprintf("omamqp1: program error, unrecognized param '%s', ignored.\n",
                       actpblk.descr[i].name);
         }
@@ -397,6 +404,7 @@ typedef struct {
     uint64_t tag;
     int msgs_sent;
     int msgs_settled;
+    int retries;
     sbool stopped;
 } protocolState_t;
 
@@ -407,7 +415,8 @@ typedef struct {
 static void _init_config_settings(configSettings_t *pConfig)
 {
     memset(pConfig, 0, sizeof(configSettings_t));
-    pConfig->retryDelay = 5;
+    pConfig->reconnectDelay = 5;
+    pConfig->maxRetries = 10;
 }
 
 
@@ -507,8 +516,7 @@ static void _abort_command(protocolState_t *ps)
     pthread_mutex_lock(&ipc->lock);
     switch (ipc->command) {
     case COMMAND_SEND:
-      errmsg.LogError(0, NO_ERRCODE,
-                      "omamqp1: aborted the message send in progress");
+      dbgprintf("omamqp1: aborted the message send in progress\n");
       // fallthrough:
     case COMMAND_IS_READY:
       ipc->result = RS_RET_SUSPENDED;
@@ -528,11 +536,10 @@ static void _log_error(const char *message, pn_condition_t *cond)
 {
     const char *name = pn_condition_get_name(cond);
     const char *desc = pn_condition_get_description(cond);
-    errmsg.LogError(0, NO_ERRCODE,
-                    "omamqp1: %s %s:%s\n",
-                    message,
-                    (name) ? name : "<no name>",
-                    (desc) ? desc : "<no description>");
+    dbgprintf("omamqp1: %s %s:%s\n",
+              message,
+              (name) ? name : "<no name>",
+              (desc) ? desc : "<no description>");
 }
 
 
@@ -578,22 +585,20 @@ static void dispatcher(pn_handler_t *handler, pn_event_t *event, pn_event_type_t
                     result = RS_RET_OK;
                     break;
                 case PN_REJECTED:
-                    errmsg.LogError(0, NO_ERRCODE,
-                                    "omamqp1: peer rejected log message, dropping");
-                    result = RS_RET_ERR;
+                  dbgprintf("omamqp1: message bus rejected log message: invalid message - dropping\n");
+                    // message bus considers this a 'bad message'. Cannot be redelivered.
+                    // Likely a configuration error. Drop the message by returning OK
+                    result = RS_RET_OK;
                     break;
                 case PN_RELEASED:
-                    DBGPRINTF("omamqp1: peer unable to accept message, suspending");
-                    result = RS_RET_SUSPENDED;
-                    break;
                 case PN_MODIFIED:
-                    if (pn_disposition_is_undeliverable(pn_delivery_remote(ps->delivery))) {
-                        errmsg.LogError(0, NO_ERRCODE,
-                                        "omamqp1: log message undeliverable, dropping");
-                        result = RS_RET_ERR;
+                  // the message bus cannot accept the message.  This may be temporary - retry up to maxRetries before dropping
+                    if (++ps->retries >= cfg->maxRetries) {
+                      dbgprintf("omamqp1: message bus failed to accept message - dropping\n");
+                      result = RS_RET_OK;
                     } else {
-                        DBGPRINTF("omamqp1: message modified, suspending");
-                        result = RS_RET_SUSPENDED;
+                      dbgprintf("omamqp1: message bus cannot accept message, retrying\n");
+                      result = RS_RET_SUSPENDED;
                     }
                     break;
                 case PN_RECEIVED:
@@ -601,9 +606,9 @@ static void dispatcher(pn_handler_t *handler, pn_event_t *event, pn_event_type_t
                     break;
                 default:
                     // no other terminal states defined, so ignore anything else
-                    errmsg.LogError(0, NO_ERRCODE,
-                                    "omamqp1: unknown delivery state=0x%lX, ignoring",
-                                    (unsigned long) pn_delivery_remote_state(ps->delivery));
+                    dbgprintf("omamqp1: unknown delivery state=0x%lX, assuming message accepted\n",
+                              (unsigned long) pn_delivery_remote_state(ps->delivery));
+                    result = RS_RET_OK;
                     break;
                 }
 
@@ -618,9 +623,8 @@ static void dispatcher(pn_handler_t *handler, pn_event_t *event, pn_event_type_t
                     pthread_mutex_unlock(&ipc->lock);
                     pn_delivery_settle(ps->delivery);
                     ps->delivery = NULL;
-                    if (result == RS_RET_ERR) {
-                        // try reconnecting to clear the error
-                      _close_connection(ps);
+                    if (result == RS_RET_OK) {
+                      ps->retries = 0;
                     }
                 }
             }
@@ -654,7 +658,7 @@ static void dispatcher(pn_handler_t *handler, pn_event_t *event, pn_event_type_t
         break;
 
     case PN_CONNECTION_UNBOUND:
-        DBGPRINTF("omamqp1: cleaning up connection resources");
+        DBGPRINTF("omamqp1: cleaning up connection resources\n");
         pn_connection_release(pn_event_connection(event));
         ps->conn = NULL;
         ps->sender = NULL;
@@ -670,8 +674,7 @@ static void dispatcher(pn_handler_t *handler, pn_event_t *event, pn_event_type_t
             if (pn_condition_is_set(cond)) {
                 _log_error("transport failure", cond);
             }
-            errmsg.LogError(0, NO_ERRCODE,
-                            "omamqp1: network transport failed, reconnecting...");
+            dbgprintf("omamqp1: network transport failed, reconnecting...\n");
             // the protocol thread will attempt to reconnect if it is not
             // being shut down
         }
@@ -816,8 +819,8 @@ static void *amqp1_thread(void *arg)
             pn_connection_set_user(ps->conn, user);
 
         const char *pword = cfg->password
-            ? (char *) config->password
-            : pn_url_get_password(url);
+            ? (char *) cfg->password
+            : pn_url_get_password(cfg->url);
         if (pword)
             pn_connection_set_password(ps->conn, pword);
 #endif
@@ -842,8 +845,8 @@ static void *amqp1_thread(void *arg)
 
         _abort_command(ps);   // unblock main thread if necessary
 
-        // delay retryDelay seconds before re-connecting:
-        int delay = ps->config->retryDelay;
+        // delay reconnectDelay seconds before re-connecting:
+        int delay = ps->config->reconnectDelay;
         while (delay-- > 0 && !ps->stopped) {
             srSleep(1, 0);
             _poll_command(ps);
@@ -876,7 +879,7 @@ static rsRetVal _launch_protocol_thread(instanceData *pData)
             return RS_RET_OK;
         }
     } while (rc == EAGAIN);
-    errmsg.LogError(0, RS_RET_SYS_ERR, "omamqp1: thread create failed: %d\n", rc);
+    errmsg.LogError(0, RS_RET_SYS_ERR, "omamqp1: thread create failed: %d", rc);
     return RS_RET_SYS_ERR;
 }
 
