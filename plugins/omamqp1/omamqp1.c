@@ -113,6 +113,10 @@ typedef struct _instanceData {
     int log_count;
 } instanceData;
 
+typedef struct wrkrInstanceData {
+       instanceData *pData;
+} wrkrInstanceData_t;
+
 
 /* glue code */
 
@@ -179,6 +183,11 @@ CODESTARTcreateInstance
 ENDcreateInstance
 
 
+BEGINcreateWrkrInstance
+CODESTARTcreateWrkrInstance
+ENDcreateWrkrInstance
+
+
 BEGINfreeInstance
 CODESTARTfreeInstance
 {
@@ -190,6 +199,10 @@ CODESTARTfreeInstance
     if (pData->message) pn_decref(pData->message);
 }
 ENDfreeInstance
+
+BEGINfreeWrkrInstance
+CODESTARTfreeWrkrInstance
+ENDfreeWrkrInstance
 
 
 BEGINdbgPrintInstInfo
@@ -214,6 +227,7 @@ ENDdbgPrintInstInfo
 BEGINtryResume
 CODESTARTtryResume
 {
+    instanceData *pData = pWrkrData->pData;
     // is the link active?
     iRet = _issue_command(&pData->ipc, pData->reactor, COMMAND_IS_READY, NULL);
 }
@@ -223,6 +237,7 @@ ENDtryResume
 BEGINbeginTransaction
 CODESTARTbeginTransaction
 {
+    instanceData *pData = pWrkrData->pData;
     DBGPRINTF("omamqp1: beginTransaction\n");
     pData->log_count = 0;
     if (pData->message) pn_decref(pData->message);
@@ -239,6 +254,7 @@ ENDbeginTransaction
 BEGINdoAction
 CODESTARTdoAction
 {
+    instanceData *pData = pWrkrData->pData;
     DBGPRINTF("omamqp1: doAction\n");
     if (!pData->message) ABORT_FINALIZE(RS_RET_OK);
     pn_bytes_t msg = pn_bytes(strlen((const char *)ppString[0]),
@@ -255,6 +271,7 @@ ENDdoAction
 BEGINendTransaction
 CODESTARTendTransaction
 {
+    instanceData *pData = pWrkrData->pData;
     DBGPRINTF("omamqp1: endTransaction\n");
     if (!pData->message) ABORT_FINALIZE(RS_RET_OK);
     pn_data_t *body = pn_message_body(pData->message);
@@ -365,6 +382,7 @@ ENDmodExit
 BEGINqueryEtryPt
 CODESTARTqueryEtryPt
     CODEqueryEtryPt_STD_OMOD_QUERIES
+    CODEqueryEtryPt_STD_OMOD8_QUERIES
     CODEqueryEtryPt_STD_CONF2_CNFNAME_QUERIES
     CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES
     CODEqueryEtryPt_TXIF_OMOD_QUERIES   /* use transaction interface */
