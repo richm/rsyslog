@@ -4648,6 +4648,27 @@ finalize_it:
 	RETiRet;
 }
 
+static rsRetVal jsonMerge(struct json_object *existing, struct json_object *json);
+
+static rsRetVal
+jsonMergeNonOverwrite(struct json_object *existing, struct json_object *json)
+{
+	DEFiRet;
+
+	struct json_object_iterator it = json_object_iter_begin(existing);
+	struct json_object_iterator itEnd = json_object_iter_end(existing);
+	while (!json_object_iter_equal(&it, &itEnd)) {
+		json_object_object_add(json, json_object_iter_peek_name(&it),
+			json_object_get(json_object_iter_peek_value(&it)));
+		json_object_iter_next(&it);
+	}
+
+	CHKiRet(jsonMerge(existing, json));
+finalize_it:
+	RETiRet;
+}
+
+
 static rsRetVal
 jsonMerge(struct json_object *existing, struct json_object *json)
 {
@@ -4730,7 +4751,7 @@ msgAddJSON(smsg_t * const pM, uchar *name, struct json_object *json, int force_r
 		if(*pjroot == NULL)
 			*pjroot = json;
 		else
-			CHKiRet(jsonMerge(*pjroot, json));
+			CHKiRet(jsonMergeNonOverwrite(*pjroot, json));
 	} else {
 		if(*pjroot == NULL) {
 			/* now we need a root obj */
@@ -4758,7 +4779,7 @@ msgAddJSON(smsg_t * const pM, uchar *name, struct json_object *json, int force_r
 			json_object_object_add(parent, (char*)leaf, json);
 		} else {
 			if(json_object_get_type(json) == json_type_object) {
-				CHKiRet(jsonMerge(*pjroot, json));
+				CHKiRet(jsonMergeNonOverwrite(*pjroot, json));
 			} else {
 				/* TODO: improve the code below, however, the current
 				 *       state is not really bad */
