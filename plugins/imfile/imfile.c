@@ -1125,7 +1125,7 @@ BEGINsetModCnf
 	struct cnfparamvals *pvals = NULL;
 	int i;
 CODESTARTsetModCnf
-	loadModConf->opMode = OPMODE_INOTIFY; /* new style config has different default! */
+	loadModConf->opMode = OPMODE_POLLING; /* Difference from upstream, upstream has default option INOTIFY */
 	pvals = nvlstGetParams(lst, &modpblk, NULL);
 	if(pvals == NULL) {
 		errmsg.LogError(0, RS_RET_MISSING_CNFPARAMS, "imfile: error processing module "
