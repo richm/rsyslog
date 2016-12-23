@@ -938,6 +938,8 @@ initTCP(wrkrInstanceData_t *pWrkrData)
 		CHKiRet(tcpclt.SetSendPrepRetry(pWrkrData->pTCPClt, TCPSendPrepRetry));
 		CHKiRet(tcpclt.SetFraming(pWrkrData->pTCPClt, pData->tcp_framing));
 		CHKiRet(tcpclt.SetRebindInterval(pWrkrData->pTCPClt, pData->iRebindInterval));
+		if (cs.iStrmDrvrMode)
+                        pData->iStrmDrvrMode = cs.iStrmDrvrMode;
 	}
 finalize_it:
 	RETiRet;
