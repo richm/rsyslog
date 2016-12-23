@@ -1046,14 +1046,9 @@ CODESTARTcommitTransaction
 		writeFile(pData, pParams, i);
 	}
 	/* Note: pStrm may be NULL if there was an error opening the stream */
-	if(pData->bUseAsyncWriter) {
-		if(pData->bFlushOnTXEnd && pData->pStrm != NULL) {
+	if(pData->bFlushOnTXEnd && pData->pStrm != NULL) {
+		if(!pData->bUseAsyncWriter)
 			CHKiRet(strm.Flush(pData->pStrm));
-		}
-	} else {
-		if(pData->pStrm != NULL) {
-			CHKiRet(strm.Flush(pData->pStrm));
-		}
 	}
 
 finalize_it:
