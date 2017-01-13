@@ -1191,6 +1191,15 @@ initAll(int argc, char **argv)
 		case 'w': /* disable disallowed host warnings */
 		case 'C':
 		case 'x': /* disable dns for remote messages */
+		case 'a': /* obsolete switches from here below for backwards compatibility */
+		case 'c':
+		case 'g':
+		case 'h':
+		case 'm':
+		case 'o':
+		case 'p':
+		case 'r':
+		case 't':
 			CHKiRet(bufOptAdd(ch, optarg));
 			break;
 #if defined(_AIX)
@@ -1249,27 +1258,15 @@ initAll(int argc, char **argv)
 		DBGPRINTF("deque option %c, optarg '%s'\n", ch, (arg == NULL) ? "" : arg);
 		switch((char)ch) {
                 case '4':
-			fprintf (stderr, "rsyslogd: the -4 command line option will go away "
-				 "soon.\nPlease use the global(net.ipprotocol=\"ipv4-only\") "
-				 "configuration parameter instead.\n");
 	                glbl.SetDefPFFamily(PF_INET);
                         break;
                 case '6':
-			fprintf (stderr, "rsyslogd: the -6 command line option will go away "
-				 "soon.\nPlease use the global(net.ipprotocol=\"ipv6-only\") "
-				 "configuration parameter instead.\n");
                         glbl.SetDefPFFamily(PF_INET6);
                         break;
                 case 'A':
-			fprintf (stderr, "rsyslogd: the -A command line option will go away "
-				 "soon.\n"
-				 "Please use the omfwd parameter \"upd.sendToAll\" instead.\n");
                         send_to_all++;
                         break;
 		case 'S':		/* Source IP for local client to be used on multihomed host */
-			fprintf (stderr, "rsyslogd: the -S command line option will go away "
-				 "soon.\n"
-				 "Please use the omrelp parameter \"localClientIP\" instead.\n");
 			if(glbl.GetSourceIPofLocalClient() != NULL) {
 				fprintf (stderr, "rsyslogd: Only one -S argument allowed, the first one is taken.\n");
 			} else {
@@ -1283,9 +1280,6 @@ initAll(int argc, char **argv)
 			PidFile = arg;
 			break;
 		case 'l':
-			fprintf (stderr, "rsyslogd: the -l command line option will go away "
-				 "soon.\n Make yourself heard on the rsyslog mailing "
-				 "list if you need it any longer.\n");
 			if(glbl.GetLocalHosts() != NULL) {
 				fprintf (stderr, "rsyslogd: Only one -l argument allowed, the first one is taken.\n");
 			} else {
@@ -1299,21 +1293,12 @@ initAll(int argc, char **argv)
 			iConfigVerify = (arg == NULL) ? 0 : atoi(arg);
 			break;
 		case 'q':               /* add hostname if DNS resolving has failed */
-			fprintf (stderr, "rsyslogd: the -q command line option will go away "
-				 "soon.\nPlease use the global(net.aclAddHostnameOnFail=\"on\") "
-				 "configuration parameter instead.\n");
 		        *(net.pACLAddHostnameOnFail) = 1;
 		        break;
 		case 'Q':               /* dont resolve hostnames in ACL to IPs */
-			fprintf (stderr, "rsyslogd: the -Q command line option will go away "
-				 "soon.\nPlease use the global(net.aclResolveHostname=\"off\") "
-				 "configuration parameter instead.\n");
 		        *(net.pACLDontResolve) = 1;
 		        break;
 		case 's':
-			fprintf (stderr, "rsyslogd: the -s command line option will go away "
-				 "soon.\n Make yourself heard on the rsyslog mailing "
-				 "list if you need it any longer.\n");
 			if(glbl.GetStripDomains() != NULL) {
 				fprintf (stderr, "rsyslogd: Only one -s argument allowed, the first one is taken.\n");
 			} else {
@@ -1353,16 +1338,20 @@ initAll(int argc, char **argv)
 			bChDirRoot = 0;
 			break;
 		case 'w':		/* disable disallowed host warnigs */
-			fprintf (stderr, "rsyslogd: the -w command line option will go away "
-				 "soon.\nPlease use the global(net.permitWarning=\"off\") "
-				 "configuration parameter instead.\n");
 			glbl.SetOption_DisallowWarning(0);
 			break;
 		case 'x':		/* disable dns for remote messages */
-			fprintf (stderr, "rsyslogd: the -x command line option will go away "
-				 "soon.\nPlease use the global(net.enableDNS=\"off\") "
-				 "configuration parameter instead.\n");
 			glbl.SetDisableDNS(1);
+			break;
+		case 'a':
+		case 'c':
+		case 'g':
+		case 'h':
+		case 'm':
+		case 'o':
+		case 'p':
+		case 'r':
+		case 't':
 			break;
                case '?':
 		default:
