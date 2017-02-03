@@ -920,8 +920,6 @@ createListner(es_str_t *port, struct cnfparamvals *pvals)
 			inst->bAppendPortToInpname = (int) pvals[i].val.d.n;
 			bAppendPortUsed = 1;
 		} else if(!strcmp(inppblk.descr[i].name, "inputname")) {
-			errmsg.LogError(0, RS_RET_DEPRECATED , "imudp: deprecated parameter inputname "
-					"used. Suggest to use name instead");
 			if(inst->inputname != NULL) {
 				errmsg.LogError(0, RS_RET_INVALID_PARAMS, "imudp: name and inputname "
 						"parameter specified - only one can be used");
@@ -929,8 +927,6 @@ createListner(es_str_t *port, struct cnfparamvals *pvals)
 			}
 			inst->inputname = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
 		} else if(!strcmp(inppblk.descr[i].name, "inputname.appendport")) {
-			errmsg.LogError(0, RS_RET_DEPRECATED , "imudp: deprecated parameter inputname.appendport "
-					"used. Suggest to use name.appendport instead");
 			if(bAppendPortUsed) {
 				errmsg.LogError(0, RS_RET_INVALID_PARAMS, "imudp: name.appendport and "
 						"inputname.appendport parameter specified - only one can be used");
