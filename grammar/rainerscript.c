@@ -1710,6 +1710,113 @@ doRandomGen(struct svar *__restrict__ const sourceVal) {
 	return x % max;
 }
 
+static long long
+ipv42num(char *str)
+{
+	unsigned num[4] = {0, 0, 0, 0};
+	long long value = -1;
+	size_t len = strlen(str);
+	int cyc = 0;
+	int prevdot = 0;
+	int startblank = 0;
+	int endblank = 0;
+	DBGPRINTF("rainerscript: (ipv42num) arg: '%s'\n", str);
+	for(unsigned int i = 0 ; i < len ; i++) {
+		switch(str[i]){
+		case '0':
+		case '1':
+		case '2':
+		case '3':
+		case '4':
+		case '5':
+		case '6':
+		case '7':
+		case '8':
+		case '9':
+			if(endblank == 1){
+				DBGPRINTF("rainerscript: (ipv42num) error: wrong IP-Address format (invalid space(1))\n");
+				goto done;
+			}
+			prevdot = 0;
+			startblank = 0;
+			DBGPRINTF("rainerscript: (ipv42num) cycle: %d\n", cyc);
+			num[cyc] = num[cyc]*10+(str[i]-'0');
+			break;
+		case ' ':
+			prevdot = 0;
+			if(i == 0 || startblank == 1){
+				startblank = 1;
+				break;
+			}
+			else{
+				endblank = 1;
+				break;
+			}
+		case '.':
+			if(endblank == 1){
+				DBGPRINTF("rainerscript: (ipv42num) error: wrong IP-Address format (inalid space(2))\n");
+				goto done;
+			}
+			startblank = 0;
+			if(prevdot == 1){
+				DBGPRINTF("rainerscript: (ipv42num) error: wrong IP-Address format (two dots after one another)\n");
+				goto done;
+			}
+			prevdot = 1;
+			cyc++;
+			if(cyc > 3){
+				DBGPRINTF("rainerscript: (ipv42num) error: wrong IP-Address format (too many dots)\n");
+				goto done;
+			}
+			break;
+		default:
+			DBGPRINTF("rainerscript: (ipv42num) error: wrong IP-Address format (invalid charakter)\n");
+			goto done;
+		}
+	}
+	if(cyc != 3){
+		DBGPRINTF("rainerscript: (ipv42num) error: wrong IP-Address format (wrong number of dots)\n");
+		goto done;
+	}
+	value = num[0]*256*256*256+num[1]*256*256+num[2]*256+num[3];
+done:
+	DBGPRINTF("rainerscript: (ipv42num): return value:'%lld'\n",value);
+	return(value);
+}
+
+
+static es_str_t*
+num2ipv4(struct svar *__restrict__ const sourceVal) {
+	int success = 0;
+	int numip[4];
+	char str[16];
+	size_t len;
+	es_str_t *estr;
+	long long num = var2Number(sourceVal, &success);
+	DBGPRINTF("rainrescript: (num2ipv4) var2Number output: '%lld\n'", num);
+	if (! success) {
+		DBGPRINTF("rainerscript: (num2ipv4) couldn't access number\n");
+		len = snprintf(str, 16, "-1");
+		goto done;
+	}
+	if(num < 0 || num > 4294967295) {
+		DBGPRINTF("rainerscript: (num2ipv4) invalid number(too big/negative); does not represent IPv4 address\n");
+		len = snprintf(str, 16, "-1");
+		goto done;
+	}
+	for(int i = 0 ; i < 4 ; i++){
+		numip[i] = num % 256;
+		num = num / 256;
+	}
+	DBGPRINTF("rainerscript: (num2ipv4) Numbers: 1:'%d' 2:'%d' 3:'%d' 4:'%d'\n", numip[0], numip[1], numip[2], numip[3]);
+	len = snprintf(str, 16, "%d.%d.%d.%d", numip[3], numip[2], numip[1], numip[0]);
+done:
+	DBGPRINTF("rainerscript: (num2ipv4) ipv4-Address: %s, lengh: %zu\n", str, len);
+	estr = es_newStrFromCStr(str, len);
+	return(estr);
+}
+
+
 /* Perform a function call. This has been moved out of cnfExprEval in order
  * to keep the code small and easier to maintain.
  */
@@ -1773,6 +1880,12 @@ doFuncCall(struct cnffunc *__restrict__ const func, struct svar *__restrict__ co
 		cnfexprEval(func->expr[0], &r[0], usrptr);
 		ret->d.n = doRandomGen(&r[0]);
 		ret->datatype = 'N';
+		varFreeMembers(&r[0]);
+		break;
+	case CNFFUNC_NUM2IPV4:
+		cnfexprEval(func->expr[0], &r[0], usrptr);
+		ret->d.estr = num2ipv4(&r[0]);
+		ret->datatype = 'S';
 		varFreeMembers(&r[0]);
 		break;
 	case CNFFUNC_GETENV:
@@ -3993,6 +4106,8 @@ funcName2ID(es_str_t *fname, unsigned short nParams)
 		GENERATE_FUNC("strlen", 1, CNFFUNC_STRLEN);
 	} else if(FUNC_NAME("getenv")) {
 		GENERATE_FUNC("getenv", 1, CNFFUNC_GETENV);
+	} else if(FUNC_NAME("num2ipv4")) {
+		GENERATE_FUNC("num2ipv4", 1, CNFFUNC_NUM2IPV4);
 	} else if(FUNC_NAME("tolower")) {
 		GENERATE_FUNC("tolower", 1, CNFFUNC_TOLOWER);
 	} else if(FUNC_NAME("cstr")) {
