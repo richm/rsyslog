@@ -514,8 +514,10 @@ ENDdoAction
 
 BEGINendTransaction
 CODESTARTendTransaction
-	dbgprintf("omrelp: endTransaction\n");
-	relpCltHintBurstEnd(pWrkrData->pRelpClt);
+	DBGPRINTF("omrelp: endTransaction, connected %d\n", pWrkrData->bIsConnected);
+	if(pWrkrData->bIsConnected) {
+		relpCltHintBurstEnd(pWrkrData->pRelpClt);
+	}
 ENDendTransaction
 
 BEGINparseSelectorAct
