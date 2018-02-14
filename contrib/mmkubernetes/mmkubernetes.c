@@ -52,6 +52,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <libestr.h>
 #include <json.h>
 #include <curl/curl.h>
@@ -63,6 +64,7 @@
 #include "errmsg.h"
 #include "regexp.h"
 #include "hashtable.h"
+#include "srUtils.h"
 
 /* static data */
 MODULE_TYPE_OUTPUT /* this is technically an output plugin */
@@ -72,7 +74,7 @@ DEF_OMOD_STATIC_DATA
 DEFobjCurrIf(errmsg)
 DEFobjCurrIf(regexp)
 
-#define DFLT_FILENAME_REGEX "var\\.log\\.containers\\.([a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_([^_]+)_(.+)-([a-z0-9]{64})\\.log$"
+#define DFLT_FILENAME_REGEX "/var/log/containers/([a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_([^_]+)_(.+)-([a-z0-9]{64})\\.log$"
 #define DFLT_SRCMD_PATH "$!metadata!filename"
 #define DFLT_DSTMD_PATH "$!metadata"
 
@@ -86,16 +88,24 @@ static struct cache_s {
 /* module configuration data */
 struct modConfData_s {
 	rsconf_t *pConf;	/* our overall config object */
-	uchar *kubernetesUrl;	/**< where to place queries */
+	uchar *kubernetesUrl;	/**< scheme, host, port, and optional path prefix for Kubernetes API lookups */
 	uchar *srcMetadataPath;	/**< where to get data for kubernetes queries */
 	uchar *dstMetadataPath;	/**< where to put metadata obtained from kubernetes */
+	uchar *caCertFile; /**< File holding the CA cert (+optional chain) of CA that issued the Kubernetes server cert */
+	sbool allowUnsignedCerts; /**< For testing/debugging - do not check for CA certs (CURLOPT_SSL_VERIFYPEER FALSE) */
+	uchar *token; /**< The token value to use to authenticate to Kubernetes - takes precedence over tokenFile */
+	uchar *tokenFile; /**< The file whose contents is the token value to use to authenticate to Kubernetes */
 };
 
 /* action (instance) configuration data */
 typedef struct _instanceData {
-	uchar *kubernetesUrl;	/**< where to place queries */
+	uchar *kubernetesUrl;	/**< scheme, host, port, and optional path prefix for Kubernetes API lookups */
 	uchar *srcMetadataPath;	/**< where to get data for kubernetes queries */
 	uchar *dstMetadataPath;	/**< where to put metadata obtained from kubernetes */
+	uchar *caCertFile; /**< File holding the CA cert (+optional chain) of CA that issued the Kubernetes server cert */
+	sbool allowUnsignedCerts; /**< For testing/debugging - do not check for CA certs (CURLOPT_SSL_VERIFYPEER FALSE) */
+	uchar *token; /**< The token value to use to authenticate to Kubernetes - takes precedence over tokenFile */
+	uchar *tokenFile; /**< The file whose contents is the token value to use to authenticate to Kubernetes */
 	regex_t fnRegex;
 	struct cache_s *cache;
 } instanceData;
@@ -112,7 +122,11 @@ typedef struct wrkrInstanceData {
 static struct cnfparamdescr modpdescr[] = {
 	{ "kubernetesurl", eCmdHdlrString, 0 },
 	{ "srcmetadatapath", eCmdHdlrString, 0 },
-	{ "dstmetadatapath", eCmdHdlrString, 0 }
+	{ "dstmetadatapath", eCmdHdlrString, 0 },
+	{ "tls.cacert", eCmdHdlrString, 0 },
+	{ "allowunsignedcerts", eCmdHdlrBinary, 0 },
+	{ "token", eCmdHdlrString, 0 },
+	{ "tokenfile", eCmdHdlrString, 0 }
 };
 static struct cnfparamblk modpblk = {
 	CNFPARAMBLK_VERSION,
@@ -124,7 +138,11 @@ static struct cnfparamblk modpblk = {
 static struct cnfparamdescr actpdescr[] = {
 	{ "kubernetesurl", eCmdHdlrString, 0 },
 	{ "srcmetadatapath", eCmdHdlrString, 0 },
-	{ "dstmetadatapath", eCmdHdlrString, 0 }
+	{ "dstmetadatapath", eCmdHdlrString, 0 },
+	{ "tls.cacert", eCmdHdlrString, 0 },
+	{ "allowunsignedcerts", eCmdHdlrBinary, 0 },
+	{ "token", eCmdHdlrString, 0 },
+	{ "tokenfile", eCmdHdlrString, 0 }
 };
 static struct cnfparamblk actpblk =
 	{ CNFPARAMBLK_VERSION,
@@ -146,6 +164,7 @@ ENDbeginCnfLoad
 BEGINsetModCnf
 	struct cnfparamvals *pvals = NULL;
 	int i;
+	FILE *fp;
 CODESTARTsetModCnf
 	pvals = nvlstGetParams(lst, &modpblk, NULL);
 	if(pvals == NULL) {
@@ -173,6 +192,37 @@ CODESTARTsetModCnf
 			free(loadModConf->dstMetadataPath);
 			loadModConf->dstMetadataPath = (uchar *) es_str2cstr(pvals[i].val.d.estr, NULL);
 			/* todo: sanitize the path */
+		} else if(!strcmp(modpblk.descr[i].name, "tls.cacert")) {
+			free(loadModConf->caCertFile);
+			loadModConf->caCertFile = (uchar *) es_str2cstr(pvals[i].val.d.estr, NULL);
+			fp = fopen((const char*)loadModConf->caCertFile, "r");
+			if(fp == NULL) {
+				char errStr[1024];
+				rs_strerror_r(errno, errStr, sizeof(errStr));
+				errmsg.LogError(0, RS_RET_NO_FILE_ACCESS,
+						"error: certificate file %s couldn't be accessed: %s\n",
+						loadModConf->caCertFile, errStr);
+			} else {
+				fclose(fp);
+			}
+		} else if(!strcmp(modpblk.descr[i].name, "allowunsignedcerts")) {
+			loadModConf->allowUnsignedCerts = pvals[i].val.d.n;
+		} else if(!strcmp(modpblk.descr[i].name, "token")) {
+			free(loadModConf->token);
+			loadModConf->token = (uchar *) es_str2cstr(pvals[i].val.d.estr, NULL);
+		} else if(!strcmp(modpblk.descr[i].name, "tokenfile")) {
+			free(loadModConf->tokenFile);
+			loadModConf->tokenFile = (uchar *) es_str2cstr(pvals[i].val.d.estr, NULL);
+			fp = fopen((const char*)loadModConf->tokenFile, "r");
+			if(fp == NULL) {
+				char errStr[1024];
+				rs_strerror_r(errno, errStr, sizeof(errStr));
+				errmsg.LogError(0, RS_RET_NO_FILE_ACCESS,
+						"error: token file %s couldn't be accessed: %s\n",
+						loadModConf->tokenFile, errStr);
+			} else {
+				fclose(fp);
+			}
 		} else {
 			dbgprintf("mmkubernetes: program error, non-handled "
 				"param '%s' in module() block\n", modpblk.descr[i].name);
@@ -204,6 +254,9 @@ CODESTARTfreeInstance
 	free(pData->kubernetesUrl);
 	free(pData->srcMetadataPath);
 	free(pData->dstMetadataPath);
+	free(pData->caCertFile);
+	free(pData->token);
+	free(pData->tokenFile);
 	regexp.regfree(&pData->fnRegex);
 ENDfreeInstance
 
@@ -225,14 +278,42 @@ size_t curlCB(char *data, size_t size, size_t nmemb, void *usrptr)
 BEGINcreateWrkrInstance
 CODESTARTcreateWrkrInstance
 	CURL *ctx;
-	struct curl_slist *hdr;
+	struct curl_slist *hdr = NULL;
+	char *tokenHdr = NULL;
+	FILE *fp;
 
-	hdr = curl_slist_append(NULL, "Content-Type: text/json; charset=utf-8");
+	hdr = curl_slist_append(hdr, "Content-Type: text/json; charset=utf-8");
+	if (pWrkrData->pData->token) {
+		asprintf(&tokenHdr, "Authorization: Bearer %s", pWrkrData->pData->token);
+	} else if (pWrkrData->pData->tokenFile) {
+		struct stat statbuf;
+		char *token = NULL;
+		fp = fopen((const char*)pWrkrData->pData->tokenFile, "r");
+		if (fp && !fstat(fileno(fp), &statbuf)) {
+			size_t bytesread;
+			token = malloc((statbuf.st_size+1)*sizeof(char));
+			if (0 < (bytesread = fread(token, sizeof(char), statbuf.st_size, fp))) {
+				token[bytesread] = '\0';
+				asprintf(&tokenHdr, "Authorization: Bearer %s", token);
+			}
+			free(token);
+		}
+		fclose(fp);
+	}
+	if (tokenHdr) {
+		hdr = curl_slist_append(hdr, tokenHdr);
+		free(tokenHdr);
+	}
 	pWrkrData->curlHdr = hdr;
 	ctx = curl_easy_init();
 	curl_easy_setopt(ctx, CURLOPT_HTTPHEADER, hdr);
 	curl_easy_setopt(ctx, CURLOPT_WRITEFUNCTION, curlCB);
 	curl_easy_setopt(ctx, CURLOPT_WRITEDATA, pWrkrData);
+	if(pWrkrData->pData->caCertFile)
+		curl_easy_setopt(ctx, CURLOPT_CAINFO, pWrkrData->pData->caCertFile);
+	if(pWrkrData->pData->allowUnsignedCerts)
+		curl_easy_setopt(ctx, CURLOPT_SSL_VERIFYPEER, 0);
+
 	pWrkrData->curlCtx = ctx;
 ENDcreateWrkrInstance
 
@@ -274,6 +355,8 @@ static void cacheFree(struct cache_s *cache)
 BEGINnewActInst
 	struct cnfparamvals *pvals = NULL;
 	int i, ret;
+	FILE *fp;
+	int setallowunsignedcerts = 0;
 CODESTARTnewActInst
 	DBGPRINTF("newActInst (mmkubernetes)\n");
 
@@ -307,6 +390,38 @@ CODESTARTnewActInst
 			free(pData->dstMetadataPath);
 			pData->dstMetadataPath = (uchar *) es_str2cstr(pvals[i].val.d.estr, NULL);
 			/* todo: sanitize the path */
+		} else if(!strcmp(actpblk.descr[i].name, "tls.cacert")) {
+			free(pData->caCertFile);
+			pData->caCertFile = (uchar *) es_str2cstr(pvals[i].val.d.estr, NULL);
+			fp = fopen((const char*)pData->caCertFile, "r");
+			if(fp == NULL) {
+				char errStr[1024];
+				rs_strerror_r(errno, errStr, sizeof(errStr));
+				errmsg.LogError(0, RS_RET_NO_FILE_ACCESS,
+						"error: certificate file %s couldn't be accessed: %s\n",
+						pData->caCertFile, errStr);
+			} else {
+				fclose(fp);
+			}
+		} else if(!strcmp(actpblk.descr[i].name, "allowunsignedcerts")) {
+			pData->allowUnsignedCerts = pvals[i].val.d.n;
+			setallowunsignedcerts = 1;
+		} else if(!strcmp(actpblk.descr[i].name, "token")) {
+			free(pData->token);
+			pData->token = (uchar *) es_str2cstr(pvals[i].val.d.estr, NULL);
+		} else if(!strcmp(actpblk.descr[i].name, "tokenfile")) {
+			free(pData->tokenFile);
+			pData->tokenFile = (uchar *) es_str2cstr(pvals[i].val.d.estr, NULL);
+			fp = fopen((const char*)pData->tokenFile, "r");
+			if(fp == NULL) {
+				char errStr[1024];
+				rs_strerror_r(errno, errStr, sizeof(errStr));
+				errmsg.LogError(0, RS_RET_NO_FILE_ACCESS,
+						"error: token file %s couldn't be accessed: %s\n",
+						pData->tokenFile, errStr);
+			} else {
+				fclose(fp);
+			}
 		} else {
 			dbgprintf("mmkubernetes: program error, non-handled "
 				"param '%s' in action() block\n", actpblk.descr[i].name);
@@ -323,6 +438,14 @@ CODESTARTnewActInst
 		pData->srcMetadataPath = (uchar *) strdup((char *) loadModConf->srcMetadataPath);
 	if(pData->dstMetadataPath == NULL)
 		pData->dstMetadataPath = (uchar *) strdup((char *) loadModConf->dstMetadataPath);
+	if(pData->caCertFile == NULL && loadModConf->caCertFile)
+		pData->caCertFile = (uchar *) strdup((char *) loadModConf->caCertFile);
+	if (!setallowunsignedcerts)
+		pData->allowUnsignedCerts = loadModConf->allowUnsignedCerts;
+	if(pData->token == NULL && loadModConf->token)
+		pData->token = (uchar *) strdup((char *) loadModConf->token);
+	if(pData->tokenFile == NULL && loadModConf->tokenFile)
+		pData->tokenFile = (uchar *) strdup((char *) loadModConf->tokenFile);
 
 	/* todo: make file regexp configurable */
 	ret = regexp.regcomp(&pData->fnRegex, DFLT_FILENAME_REGEX, REG_EXTENDED);
@@ -388,6 +511,9 @@ CODESTARTfreeCnf
 	free(pModConf->kubernetesUrl);
 	free(pModConf->srcMetadataPath);
 	free(pModConf->dstMetadataPath);
+	free(pModConf->caCertFile);
+	free(pModConf->token);
+	free(pModConf->tokenFile);
 	for(i = 0; caches[i] != NULL; i++)
 		cacheFree(caches[i]);
 	free(caches);
@@ -400,6 +526,10 @@ CODESTARTdbgPrintInstInfo
 	dbgprintf("\tkubernetesUrl='%s'\n", pData->kubernetesUrl);
 	dbgprintf("\tsrcMetadataPath='%s'\n", pData->srcMetadataPath);
 	dbgprintf("\tdstMetadataPath='%s'\n", pData->dstMetadataPath);
+	dbgprintf("\ttls.cacert='%s'\n", pData->caCertFile);
+	dbgprintf("\tallowUnsignedCerts='%d'\n", pData->allowUnsignedCerts);
+	dbgprintf("\ttoken='%s'\n", pData->token);
+	dbgprintf("\ttokenFile='%s'\n", pData->tokenFile);
 ENDdbgPrintInstInfo
 
 
@@ -479,18 +609,11 @@ queryKB(wrkrInstanceData_t *pWrkrData, char *url, struct json_object **rply)
 	ccode = curl_easy_setopt(pWrkrData->curlCtx, CURLOPT_URL, url);
 	if(ccode != CURLE_OK)
 		ABORT_FINALIZE(RS_RET_ERR);
-	ccode = curl_easy_perform(pWrkrData->curlCtx);
-	switch(ccode) {
-		case CURLE_COULDNT_CONNECT:
-		case CURLE_COULDNT_RESOLVE_HOST:
-		case CURLE_COULDNT_RESOLVE_PROXY:
-		case CURLE_HTTP_RETURNED_ERROR:
-		case CURLE_WRITE_ERROR:
-			dbgprintf("mmkubernetes: curl connection failed "
-				"with code %d.\n", ccode);
-			ABORT_FINALIZE(RS_RET_ERR);
-		default:
-			break;
+	if (CURLE_OK != (ccode = curl_easy_perform(pWrkrData->curlCtx))) {
+		errmsg.LogMsg(0, RS_RET_ERR, LOG_ERR,
+				      "mmkubernetes: failed to connect to [%s] - %d:%s\n",
+				      url, ccode, curl_easy_strerror(ccode));
+		ABORT_FINALIZE(RS_RET_ERR);
 	}
 
 	/* parse retrieved data */
@@ -500,6 +623,9 @@ queryKB(wrkrInstanceData_t *pWrkrData, char *url, struct json_object **rply)
 	json_tokener_free(jt);
 	if(!json_object_is_type(jo, json_type_object)) {
 		json_object_put(jo);
+		errmsg.LogMsg(0, RS_RET_JSON_PARSE_ERR, LOG_INFO,
+				      "mmkubernetes: unable to parse string as JSON:[%.*s]\n",
+					  (int)pWrkrData->curlRplyLen, pWrkrData->curlRply);
 		ABORT_FINALIZE(RS_RET_JSON_PARSE_ERR);
 	}
 
