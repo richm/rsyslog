@@ -77,6 +77,8 @@ DEFobjCurrIf(regexp)
 #define DFLT_FILENAME_REGEX "/var/log/containers/([a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_([^_]+)_(.+)-([a-z0-9]{64})\\.log$"
 #define DFLT_SRCMD_PATH "$!metadata!filename"
 #define DFLT_DSTMD_PATH "$!metadata"
+#define DFLT_DE_DOT 1 /* true */
+#define DFLT_DE_DOT_SEPARATOR "_"
 
 static struct cache_s {
 	const uchar *kbUrl;
@@ -84,6 +86,12 @@ static struct cache_s {
 	struct hashtable *nsHt;
 	pthread_mutex_t *cacheMtx;
 } **caches;
+
+typedef struct {
+	int nmemb;
+	uchar **patterns;
+	regex_t *regexps;
+} annotation_match_t;
 
 /* module configuration data */
 struct modConfData_s {
@@ -95,6 +103,10 @@ struct modConfData_s {
 	sbool allowUnsignedCerts; /**< For testing/debugging - do not check for CA certs (CURLOPT_SSL_VERIFYPEER FALSE) */
 	uchar *token; /**< The token value to use to authenticate to Kubernetes - takes precedence over tokenFile */
 	uchar *tokenFile; /**< The file whose contents is the token value to use to authenticate to Kubernetes */
+	sbool de_dot; /**< If true (default true), convert '.' characters in labels and annotations to de_dot_separator (default '_') */
+	uchar *de_dot_separator; /**< separator character (default '_') to use for de_dotting */
+	size_t de_dot_separator_len;
+	annotation_match_t annotation_match;
 };
 
 /* action (instance) configuration data */
@@ -106,6 +118,10 @@ typedef struct _instanceData {
 	sbool allowUnsignedCerts; /**< For testing/debugging - do not check for CA certs (CURLOPT_SSL_VERIFYPEER FALSE) */
 	uchar *token; /**< The token value to use to authenticate to Kubernetes - takes precedence over tokenFile */
 	uchar *tokenFile; /**< The file whose contents is the token value to use to authenticate to Kubernetes */
+	sbool de_dot; /**< If true (default true), convert '.' characters in labels and annotations to de_dot_separator (default '_') */
+	uchar *de_dot_separator; /**< separator character (default '_') to use for de_dotting */
+	size_t de_dot_separator_len;
+	annotation_match_t annotation_match;
 	regex_t fnRegex;
 	struct cache_s *cache;
 } instanceData;
@@ -126,7 +142,10 @@ static struct cnfparamdescr modpdescr[] = {
 	{ "tls.cacert", eCmdHdlrString, 0 },
 	{ "allowunsignedcerts", eCmdHdlrBinary, 0 },
 	{ "token", eCmdHdlrString, 0 },
-	{ "tokenfile", eCmdHdlrString, 0 }
+	{ "tokenfile", eCmdHdlrString, 0 },
+	{ "annotation_match", eCmdHdlrArray, 0 },
+	{ "de_dot", eCmdHdlrBinary, 0 },
+	{ "de_dot_separator", eCmdHdlrString, 0 }
 };
 static struct cnfparamblk modpblk = {
 	CNFPARAMBLK_VERSION,
@@ -142,7 +161,10 @@ static struct cnfparamdescr actpdescr[] = {
 	{ "tls.cacert", eCmdHdlrString, 0 },
 	{ "allowunsignedcerts", eCmdHdlrBinary, 0 },
 	{ "token", eCmdHdlrString, 0 },
-	{ "tokenfile", eCmdHdlrString, 0 }
+	{ "tokenfile", eCmdHdlrString, 0 },
+	{ "annotation_match", eCmdHdlrArray, 0 },
+	{ "de_dot", eCmdHdlrBinary, 0 },
+	{ "de_dot_separator", eCmdHdlrString, 0 }
 };
 static struct cnfparamblk actpblk =
 	{ CNFPARAMBLK_VERSION,
@@ -153,6 +175,168 @@ static struct cnfparamblk actpblk =
 static modConfData_t *loadModConf = NULL;	/* modConf ptr to use for the current load process */
 static modConfData_t *runModConf = NULL;	/* modConf ptr to use for the current exec process */
 
+static void free_annotationmatch(annotation_match_t *match) {
+	if (match) {
+		for(int ii = 0 ; ii < match->nmemb; ++ii) {
+			if (match->patterns)
+				free(match->patterns[ii]);
+			if (match->regexps)
+				regexp.regfree(&match->regexps[ii]);
+		}
+		free(match->patterns);
+		match->patterns = NULL;
+		free(match->regexps);
+		match->regexps = NULL;
+		match->nmemb = 0;
+	}
+}
+
+static int init_annotationmatch(annotation_match_t *match, struct cnfarray *ar) {
+	DEFiRet;
+
+	match->nmemb = ar->nmemb;
+	CHKmalloc(match->patterns = calloc(sizeof(uchar*), match->nmemb));
+	CHKmalloc(match->regexps = calloc(sizeof(regex_t), match->nmemb));
+	for(int jj = 0; jj < ar->nmemb; ++jj) {
+		int rexret = 0;
+		match->patterns[jj] = (uchar*)es_str2cstr(ar->arr[jj], NULL);
+		if (0 != (rexret = regexp.regcomp(&match->regexps[jj], (char *)match->patterns[jj], REG_EXTENDED|REG_NOSUB))) {
+			char errMsg[512];
+			regexp.regerror(rexret, &match->regexps[jj], errMsg, sizeof(errMsg));
+			iRet = RS_RET_CONFIG_ERROR;
+			errmsg.LogError(0, iRet,
+					"error: could not compile annotation_match string [%s] into an extended regexp - %d: %s\n",
+					match->patterns[jj], rexret, errMsg);
+			break;
+		}
+	}
+finalize_it:
+	if (iRet)
+		free_annotationmatch(match);
+	RETiRet;
+}
+
+static int copy_annotationmatch(annotation_match_t *src, annotation_match_t *dest) {
+	DEFiRet;
+
+	dest->nmemb = src->nmemb;
+	CHKmalloc(dest->patterns = malloc(sizeof(uchar*) * dest->nmemb));
+	CHKmalloc(dest->regexps = calloc(sizeof(regex_t), dest->nmemb));
+	for(int jj = 0 ; jj < src->nmemb ; ++jj) {
+		CHKmalloc(dest->patterns[jj] = (uchar*)strdup((char *)src->patterns[jj]));
+		/* assumes was already successfully compiled */
+		regexp.regcomp(&dest->regexps[jj], (char *)dest->patterns[jj], REG_EXTENDED|REG_NOSUB);
+	}
+finalize_it:
+    if (iRet)
+    	free_annotationmatch(dest);
+	RETiRet;
+}
+
+/* takes a hash of annotations and returns another json object hash containing only the
+ * keys that match
+ */
+static struct json_object *match_annotations(annotation_match_t *match, struct json_object *annotations) {
+	struct json_object *ret = NULL;
+	struct json_object_iterator it = json_object_iter_begin(annotations);
+	struct json_object_iterator itEnd = json_object_iter_end(annotations);
+	size_t nmatch = 0; /* ignored REG_NOSUB */
+	regmatch_t pmatch[nmatch]; /* ignored REG_NOSUB */
+
+	while (!json_object_iter_equal(&it, &itEnd)) {
+		const char *const key = json_object_iter_peek_name(&it);
+		for (int jj = 0; jj < match->nmemb; ++jj) {
+			if (!regexp.regexec(&match->regexps[jj], key, nmatch, pmatch, 0)) {
+				if (!ret) {
+					ret = json_object_new_object();
+				}
+				json_object_object_add(ret, key, json_object_get(json_object_iter_peek_value(&it)));
+			}
+		}
+		json_object_iter_next(&it);
+	}
+	return ret;
+}
+
+/* This will take a hash of labels or annotations and will de_dot the keys.
+ * It will return a brand new hash.  AFAICT, there is no safe way to
+ * iterate over the hash while modifying it in place.
+ */
+static struct json_object *de_dot_json_object(struct json_object *jobj, const char *delim, size_t delim_len) {
+	struct json_object *ret = NULL;
+	struct json_object_iterator it = json_object_iter_begin(jobj);
+	struct json_object_iterator itEnd = json_object_iter_end(jobj);
+	es_str_t *new_es_key = NULL;
+	DEFiRet;
+
+	ret = json_object_new_object();
+	while (!json_object_iter_equal(&it, &itEnd)) {
+		const char *const key = json_object_iter_peek_name(&it);
+		const char *cc = strstr(key, ".");
+		if (NULL == cc) {
+			json_object_object_add(ret, key, json_object_get(json_object_iter_peek_value(&it)));
+		} else {
+			char *new_key = NULL;
+			const char *prevcc = key;
+			new_es_key = es_newStrFromCStr(key, (es_size_t)(cc-prevcc));
+			while (cc) {
+				if (es_addBuf(&new_es_key, (char *)delim, (es_size_t)delim_len))
+					ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+				cc += 1; /* one past . */
+				prevcc = cc; /* beginning of next substring */
+				if ((cc = strstr(prevcc, ".")) || (cc = strchr(prevcc, '\0'))) {
+					if (es_addBuf(&new_es_key, (char *)prevcc, (es_size_t)(cc-prevcc)))
+						ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+					if (!*cc)
+						cc = NULL; /* EOS - done */
+				}
+			}
+			new_key = es_str2cstr(new_es_key, NULL);
+			es_deleteStr(new_es_key);
+			new_es_key = NULL;
+			json_object_object_add(ret, new_key, json_object_get(json_object_iter_peek_value(&it)));
+			free(new_key);
+		}
+		json_object_iter_next(&it);
+	}
+finalize_it:
+	if (iRet != RS_RET_OK) {
+		json_object_put(ret);
+		ret = NULL;
+	}
+	if (new_es_key)
+		es_deleteStr(new_es_key);
+	return ret;
+}
+
+/* given a "metadata" object field, do
+ * - make sure "annotations" field has only the matching keys
+ * - de_dot the "labels" and "annotations" fields keys
+ * This modifies the jMetadata object in place
+ */
+static void parse_labels_annotations(struct json_object *jMetadata, annotation_match_t *match, sbool de_dot, const char *delim, size_t delim_len) {
+	struct json_object *jo = NULL;
+
+	if (fjson_object_object_get_ex(jMetadata, "annotations", &jo)) {
+		if ((jo = match_annotations(match, jo)))
+			json_object_object_add(jMetadata, "annotations", jo);
+		else
+			json_object_object_del(jMetadata, "annotations");
+	}
+	/* dedot labels and annotations */
+	if (de_dot) {
+		if (fjson_object_object_get_ex(jMetadata, "annotations", &jo)) {
+			if ((jo = de_dot_json_object(jo, delim, delim_len))) {
+				json_object_object_add(jMetadata, "annotations", jo);
+			}
+		}
+		if (fjson_object_object_get_ex(jMetadata, "labels", &jo)) {
+			if ((jo = de_dot_json_object(jo, delim, delim_len))) {
+				json_object_object_add(jMetadata, "labels", jo);
+			}
+		}
+	}
+}
 
 BEGINbeginCnfLoad
 CODESTARTbeginCnfLoad
@@ -178,6 +362,7 @@ CODESTARTsetModCnf
 		cnfparamsPrint(&modpblk, pvals);
 	}
 
+	loadModConf->de_dot = DFLT_DE_DOT;
 	for(i = 0 ; i < modpblk.nParams ; ++i) {
 		if(!pvals[i].bUsed) {
 			continue;
@@ -199,9 +384,11 @@ CODESTARTsetModCnf
 			if(fp == NULL) {
 				char errStr[1024];
 				rs_strerror_r(errno, errStr, sizeof(errStr));
-				errmsg.LogError(0, RS_RET_NO_FILE_ACCESS,
+				iRet = RS_RET_NO_FILE_ACCESS;
+				errmsg.LogError(0, iRet,
 						"error: certificate file %s couldn't be accessed: %s\n",
 						loadModConf->caCertFile, errStr);
+				ABORT_FINALIZE(iRet);
 			} else {
 				fclose(fp);
 			}
@@ -217,12 +404,24 @@ CODESTARTsetModCnf
 			if(fp == NULL) {
 				char errStr[1024];
 				rs_strerror_r(errno, errStr, sizeof(errStr));
-				errmsg.LogError(0, RS_RET_NO_FILE_ACCESS,
+				iRet = RS_RET_NO_FILE_ACCESS;
+				errmsg.LogError(0, iRet,
 						"error: token file %s couldn't be accessed: %s\n",
 						loadModConf->tokenFile, errStr);
+				ABORT_FINALIZE(iRet);
 			} else {
 				fclose(fp);
 			}
+		} else if(!strcmp(modpblk.descr[i].name, "annotation_match")) {
+			free_annotationmatch(&loadModConf->annotation_match);
+			int ret;
+			if ((ret = init_annotationmatch(&loadModConf->annotation_match, pvals[i].val.d.ar)))
+				ABORT_FINALIZE(ret);
+		} else if(!strcmp(modpblk.descr[i].name, "de_dot")) {
+			loadModConf->de_dot = pvals[i].val.d.n;
+		} else if(!strcmp(modpblk.descr[i].name, "de_dot_separator")) {
+			free(loadModConf->de_dot_separator);
+			loadModConf->de_dot_separator = (uchar *) es_str2cstr(pvals[i].val.d.estr, NULL);
 		} else {
 			dbgprintf("mmkubernetes: program error, non-handled "
 				"param '%s' in module() block\n", modpblk.descr[i].name);
@@ -235,6 +434,9 @@ CODESTARTsetModCnf
 		loadModConf->srcMetadataPath = (uchar *) strdup(DFLT_SRCMD_PATH);
 	if(loadModConf->dstMetadataPath == NULL)
 		loadModConf->dstMetadataPath = (uchar *) strdup(DFLT_DSTMD_PATH);
+	if(loadModConf->de_dot_separator == NULL)
+		loadModConf->de_dot_separator = (uchar *) strdup(DFLT_DE_DOT_SEPARATOR);
+	loadModConf->de_dot_separator_len = strlen((const char *)loadModConf->de_dot_separator);
 
 	caches = calloc(1, sizeof(struct cache_s *));
 
@@ -258,6 +460,8 @@ CODESTARTfreeInstance
 	free(pData->token);
 	free(pData->tokenFile);
 	regexp.regfree(&pData->fnRegex);
+	free_annotationmatch(&pData->annotation_match);
+	free(pData->de_dot_separator);
 ENDfreeInstance
 
 size_t curlCB(char *data, size_t size, size_t nmemb, void *usrptr)
@@ -356,7 +560,6 @@ BEGINnewActInst
 	struct cnfparamvals *pvals = NULL;
 	int i, ret;
 	FILE *fp;
-	int setallowunsignedcerts = 0;
 CODESTARTnewActInst
 	DBGPRINTF("newActInst (mmkubernetes)\n");
 
@@ -376,6 +579,8 @@ CODESTARTnewActInst
 	CHKiRet(OMSRsetEntry(*ppOMSR, 0, NULL, OMSR_TPL_AS_MSG));
 	CHKiRet(createInstance(&pData));
 
+	pData->de_dot = loadModConf->de_dot;
+	pData->allowUnsignedCerts = loadModConf->allowUnsignedCerts;
 	for(i = 0 ; i < actpblk.nParams ; ++i) {
 		if(!pvals[i].bUsed) {
 			continue;
@@ -397,15 +602,16 @@ CODESTARTnewActInst
 			if(fp == NULL) {
 				char errStr[1024];
 				rs_strerror_r(errno, errStr, sizeof(errStr));
-				errmsg.LogError(0, RS_RET_NO_FILE_ACCESS,
+				iRet = RS_RET_NO_FILE_ACCESS;
+				errmsg.LogError(0, iRet,
 						"error: certificate file %s couldn't be accessed: %s\n",
 						pData->caCertFile, errStr);
+				ABORT_FINALIZE(iRet);
 			} else {
 				fclose(fp);
 			}
 		} else if(!strcmp(actpblk.descr[i].name, "allowunsignedcerts")) {
 			pData->allowUnsignedCerts = pvals[i].val.d.n;
-			setallowunsignedcerts = 1;
 		} else if(!strcmp(actpblk.descr[i].name, "token")) {
 			free(pData->token);
 			pData->token = (uchar *) es_str2cstr(pvals[i].val.d.estr, NULL);
@@ -416,12 +622,23 @@ CODESTARTnewActInst
 			if(fp == NULL) {
 				char errStr[1024];
 				rs_strerror_r(errno, errStr, sizeof(errStr));
-				errmsg.LogError(0, RS_RET_NO_FILE_ACCESS,
+				iRet = RS_RET_NO_FILE_ACCESS;
+				errmsg.LogError(0, iRet,
 						"error: token file %s couldn't be accessed: %s\n",
 						pData->tokenFile, errStr);
+				ABORT_FINALIZE(iRet);
 			} else {
 				fclose(fp);
 			}
+		} else if(!strcmp(actpblk.descr[i].name, "annotation_match")) {
+			free_annotationmatch(&pData->annotation_match);
+			if (RS_RET_OK != (iRet = init_annotationmatch(&pData->annotation_match, pvals[i].val.d.ar)))
+				ABORT_FINALIZE(iRet);
+		} else if(!strcmp(actpblk.descr[i].name, "de_dot")) {
+			pData->de_dot = pvals[i].val.d.n;
+		} else if(!strcmp(actpblk.descr[i].name, "de_dot_separator")) {
+			free(pData->de_dot_separator);
+			pData->de_dot_separator = (uchar *) es_str2cstr(pvals[i].val.d.estr, NULL);
 		} else {
 			dbgprintf("mmkubernetes: program error, non-handled "
 				"param '%s' in action() block\n", actpblk.descr[i].name);
@@ -440,18 +657,26 @@ CODESTARTnewActInst
 		pData->dstMetadataPath = (uchar *) strdup((char *) loadModConf->dstMetadataPath);
 	if(pData->caCertFile == NULL && loadModConf->caCertFile)
 		pData->caCertFile = (uchar *) strdup((char *) loadModConf->caCertFile);
-	if (!setallowunsignedcerts)
-		pData->allowUnsignedCerts = loadModConf->allowUnsignedCerts;
 	if(pData->token == NULL && loadModConf->token)
 		pData->token = (uchar *) strdup((char *) loadModConf->token);
 	if(pData->tokenFile == NULL && loadModConf->tokenFile)
 		pData->tokenFile = (uchar *) strdup((char *) loadModConf->tokenFile);
+	if(pData->de_dot_separator == NULL && loadModConf->de_dot_separator)
+		pData->de_dot_separator = (uchar *) strdup((char *) loadModConf->de_dot_separator);
+	if((pData->annotation_match.nmemb == 0) && (loadModConf->annotation_match.nmemb > 0))
+		copy_annotationmatch(&loadModConf->annotation_match, &pData->annotation_match);
+
+	pData->de_dot_separator_len = strlen((const char *)pData->de_dot_separator);
 
 	/* todo: make file regexp configurable */
-	ret = regexp.regcomp(&pData->fnRegex, DFLT_FILENAME_REGEX, REG_EXTENDED);
-	if(ret) {
-		dbgprintf("mmkubernetes: regexp compilation failed with code %d.\n", ret);
-		ABORT_FINALIZE(RS_RET_ERR);
+	if((ret = regexp.regcomp(&pData->fnRegex, DFLT_FILENAME_REGEX, REG_EXTENDED))) {
+		char errMsg[512];
+		regexp.regerror(ret, &pData->fnRegex, errMsg, sizeof(errMsg));
+		iRet = RS_RET_CONFIG_ERROR;
+		errmsg.LogError(0, iRet,
+				"error: could not compile filename match string [%s] into an extended regexp - %d: %s\n",
+				DFLT_FILENAME_REGEX, ret, errMsg);
+		ABORT_FINALIZE(iRet);
 	}
 
 	/* get the cache for this url */
@@ -514,6 +739,8 @@ CODESTARTfreeCnf
 	free(pModConf->caCertFile);
 	free(pModConf->token);
 	free(pModConf->tokenFile);
+	free(pModConf->de_dot_separator);
+	free_annotationmatch(&pModConf->annotation_match);
 	for(i = 0; caches[i] != NULL; i++)
 		cacheFree(caches[i]);
 	free(caches);
@@ -530,6 +757,8 @@ CODESTARTdbgPrintInstInfo
 	dbgprintf("\tallowUnsignedCerts='%d'\n", pData->allowUnsignedCerts);
 	dbgprintf("\ttoken='%s'\n", pData->token);
 	dbgprintf("\ttokenFile='%s'\n", pData->tokenFile);
+	dbgprintf("\tde_dot='%d'\n", pData->de_dot);
+	dbgprintf("\tde_dot_separator='%s'\n", pData->de_dot_separator);
 ENDdbgPrintInstInfo
 
 
@@ -623,6 +852,7 @@ queryKB(wrkrInstanceData_t *pWrkrData, char *url, struct json_object **rply)
 	json_tokener_free(jt);
 	if(!json_object_is_type(jo, json_type_object)) {
 		json_object_put(jo);
+		jo = NULL;
 		errmsg.LogMsg(0, RS_RET_JSON_PARSE_ERR, LOG_INFO,
 				      "mmkubernetes: unable to parse string as JSON:[%.*s]\n",
 					  (int)pWrkrData->curlRplyLen, pWrkrData->curlRply);
@@ -677,13 +907,13 @@ CODESTARTdoAction
 
 	if(jMetadata == NULL) {
 		char *url = NULL;
-		struct json_object *jReply = NULL, *jo = NULL, *jo2 = NULL, *jNewNS = NULL;
+		struct json_object *jReply = NULL, *jo = NULL, *jo2 = NULL, *jNsMeta = NULL;
 
-		/* check cache for namespace id */
-		jo2 = hashtable_search(pWrkrData->pData->cache->nsHt, ns);
+		/* check cache for namespace metadata */
+		jNsMeta = hashtable_search(pWrkrData->pData->cache->nsHt, ns);
 		pthread_mutex_unlock(pWrkrData->pData->cache->cacheMtx);
 
-		if(jo2 == NULL) {
+		if(jNsMeta == NULL) {
 			/* query kubernetes for namespace info */
 			/* todo: move url definitions elsewhere */
 			asprintf(&url, "%s/api/v1/namespaces/%s",
@@ -693,13 +923,16 @@ CODESTARTdoAction
 			/* todo: opt to ignore the missing uid? */
 			CHKiRet(iRet);
 
-			if(fjson_object_object_get_ex(jReply, "metadata", &jo2)
-				&& fjson_object_object_get_ex(jo2, "uid", &jo2))
-				jo2 = jNewNS = json_object_get(jo2);
-			else
-				jo2 = NULL;
+			if(fjson_object_object_get_ex(jReply, "metadata", &jNsMeta)) {
+				jNsMeta = json_object_get(jNsMeta);
+				parse_labels_annotations(jNsMeta, &pWrkrData->pData->annotation_match, pWrkrData->pData->de_dot,
+										 (const char *)pWrkrData->pData->de_dot_separator, pWrkrData->pData->de_dot_separator_len);
+			} else {
+				jNsMeta = NULL;
+			}
 
 			json_object_put(jReply);
+			jReply = NULL;
 		}
 
 		asprintf(&url, "%s/api/v1/namespaces/%s/pods/%s",
@@ -707,28 +940,49 @@ CODESTARTdoAction
 		iRet = queryKB(pWrkrData, url, &jReply);
 		free(url);
 		if(iRet != RS_RET_OK) {
-			if(jNewNS) {
+			/* todo: it is wrong to access jNsMeta outside of the mutex if it was
+			 * obtained from the cache
+			 */
+			if(jNsMeta) {
 				pthread_mutex_lock(pWrkrData->pData->cache->cacheMtx);
-				hashtable_insert(pWrkrData->pData->cache->nsHt, ns, jNewNS);
+				hashtable_insert(pWrkrData->pData->cache->nsHt, ns, jNsMeta);
 				ns = NULL;
 				pthread_mutex_unlock(pWrkrData->pData->cache->cacheMtx);
 			}
+			json_object_put(jReply);
+			jReply = NULL;
 			FINALIZE;
 		}
 
 		jo = json_object_new_object();
-		if(jo2)
+		if(jNsMeta && fjson_object_object_get_ex(jNsMeta, "uid", &jo2))
 			json_object_object_add(jo, "namespace_id", json_object_get(jo2));
+		if(jNsMeta && fjson_object_object_get_ex(jNsMeta, "labels", &jo2))
+			json_object_object_add(jo, "namespace_labels", json_object_get(jo2));
+		if(jNsMeta && fjson_object_object_get_ex(jNsMeta, "annotations", &jo2))
+			json_object_object_add(jo, "namespace_annotations", json_object_get(jo2));
+		if(jNsMeta && fjson_object_object_get_ex(jNsMeta, "creationTimestamp", &jo2))
+			json_object_object_add(jo, "creation_timestamp", json_object_get(jo2));
 		if(fjson_object_object_get_ex(jReply, "nodeName", &jo2))
 			json_object_object_add(jo, "host", json_object_get(jo2));
 		if(fjson_object_object_get_ex(jReply, "uid", &jo2))
 			json_object_object_add(jo, "pod_id", json_object_get(jo2));
-		/* todo: labels */
+		if(fjson_object_object_get_ex(jReply, "metadata", &jo2)) {
+			struct json_object *jo3 = NULL;
+			parse_labels_annotations(jo2, &pWrkrData->pData->annotation_match, pWrkrData->pData->de_dot,
+									 (const char *)pWrkrData->pData->de_dot_separator, pWrkrData->pData->de_dot_separator_len);
+			if(fjson_object_object_get_ex(jo2, "annotations", &jo3))
+				json_object_object_add(jo, "annotations", json_object_get(jo3));
+			if(fjson_object_object_get_ex(jo2, "labels", &jo3))
+				json_object_object_add(jo, "labels", json_object_get(jo3));
+		}
 		json_object_put(jReply);
+		jReply = NULL;
 
-		json_object_object_add(jo, "namespace", json_object_new_string(ns));
+		json_object_object_add(jo, "namespace_name", json_object_new_string(ns));
 		json_object_object_add(jo, "pod_name", json_object_new_string(podName));
 		json_object_object_add(jo, "container_name", json_object_new_string(containerName));
+		json_object_object_add(jo, "master_url", json_object_new_string((const char *)pWrkrData->pData->kubernetesUrl));
 		jMetadata = json_object_new_object();
 		json_object_object_add(jMetadata, "kubernetes", jo);
 		jo = json_object_new_object();
@@ -738,8 +992,8 @@ CODESTARTdoAction
 		pthread_mutex_lock(pWrkrData->pData->cache->cacheMtx);
 		hashtable_insert(pWrkrData->pData->cache->mdHt, mdKey, jMetadata);
 		mdKey = NULL;
-		if(jNewNS) {
-			hashtable_insert(pWrkrData->pData->cache->nsHt, ns, jNewNS);
+		if(jNsMeta) {
+			hashtable_insert(pWrkrData->pData->cache->nsHt, ns, jNsMeta);
 			ns = NULL;
 		}
 		pthread_mutex_unlock(pWrkrData->pData->cache->cacheMtx);
@@ -748,6 +1002,7 @@ CODESTARTdoAction
 	}
 
 	/* the +1 is there to skip the leading '$' */
+	/* todo: I think access to jMetadata, even read-only access, must be done with the cache lock held */
 	msgAddJSON(pMsg, (uchar *) pWrkrData->pData->dstMetadataPath + 1, json_object_get(jMetadata), 0, 0);
 
 finalize_it:
