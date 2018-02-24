@@ -74,11 +74,19 @@ DEF_OMOD_STATIC_DATA
 DEFobjCurrIf(errmsg)
 DEFobjCurrIf(regexp)
 
+/* original from fluentd plugin: var\.log\.containers\.(?<pod_name>[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_(?<namespace>[^_]+)_(?<container_name>.+)-(?<docker_id>[a-z0-9]{64})\.log$'
+ * this is for _tag_ match, not actual filename match - in_tail turns filename into a fluentd tag
+ */
 #define DFLT_FILENAME_REGEX "/var/log/containers/([a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_([^_]+)_(.+)-([a-z0-9]{64})\\.log$"
+/* original from fluentd plugin: '^(?<name_prefix>[^_]+)_(?<container_name>[^\._]+)(\.(?<container_hash>[^_]+))?_(?<pod_name>[^_]+)_(?<namespace>[^_]+)_[^_]+_[^_]+$'
+ */
+#define DFLT_CONTAINER_REGEX "^[^_]+_([^\\._]+)(\\.([^_]+))?_([^_]+)_([^_]+)_[^_]+_[^_]+$"
 #define DFLT_SRCMD_PATH "$!metadata!filename"
 #define DFLT_DSTMD_PATH "$!metadata"
 #define DFLT_DE_DOT 1 /* true */
 #define DFLT_DE_DOT_SEPARATOR "_"
+#define DFLT_CONTAINER_NAME "$!CONTAINER_NAME" /**< name of variable holding CONTAINER_NAME value */
+#define DFLT_CONTAINER_ID_FULL "$!CONTAINER_ID_FULL" /**< name of variable holding CONTAINER_ID_FULL value */
 
 static struct cache_s {
 	const uchar *kbUrl;
@@ -105,14 +113,16 @@ struct modConfData_s {
 	uchar *tokenFile; /**< The file whose contents is the token value to use to authenticate to Kubernetes */
 	sbool de_dot; /**< If true (default true), convert '.' characters in labels and annotations to de_dot_separator (default '_') */
 	uchar *de_dot_separator; /**< separator character (default '_') to use for de_dotting */
-	size_t de_dot_separator_len;
-	annotation_match_t annotation_match;
+	size_t de_dot_separator_len; /**< length of separator character */
+	annotation_match_t annotation_match; /**< annotation keys must match these to be included in record */
+	uchar *fnRegexStr; /**< match for filename to get metadata from json-file log filenames */
+	uchar *contRegexStr; /**< match for CONTAINER_NAME to get metadata from the value */
 };
 
 /* action (instance) configuration data */
 typedef struct _instanceData {
 	uchar *kubernetesUrl;	/**< scheme, host, port, and optional path prefix for Kubernetes API lookups */
-	uchar *srcMetadataPath;	/**< where to get data for kubernetes queries */
+	msgPropDescr_t *srcMetadataDescr;	/**< where to get data for kubernetes queries */
 	uchar *dstMetadataPath;	/**< where to put metadata obtained from kubernetes */
 	uchar *caCertFile; /**< File holding the CA cert (+optional chain) of CA that issued the Kubernetes server cert */
 	sbool allowUnsignedCerts; /**< For testing/debugging - do not check for CA certs (CURLOPT_SSL_VERIFYPEER FALSE) */
@@ -120,9 +130,12 @@ typedef struct _instanceData {
 	uchar *tokenFile; /**< The file whose contents is the token value to use to authenticate to Kubernetes */
 	sbool de_dot; /**< If true (default true), convert '.' characters in labels and annotations to de_dot_separator (default '_') */
 	uchar *de_dot_separator; /**< separator character (default '_') to use for de_dotting */
-	size_t de_dot_separator_len;
-	annotation_match_t annotation_match;
+	size_t de_dot_separator_len; /**< length of separator character */
+	annotation_match_t annotation_match; /**< annotation keys must match these to be included in record */
 	regex_t fnRegex;
+	regex_t contRegex;
+	msgPropDescr_t *contNameDescr; /**< CONTAINER_NAME field */
+	msgPropDescr_t *contIdFullDescr; /**< CONTAINER_ID_FULL field */
 	struct cache_s *cache;
 } instanceData;
 
@@ -145,7 +158,9 @@ static struct cnfparamdescr modpdescr[] = {
 	{ "tokenfile", eCmdHdlrString, 0 },
 	{ "annotation_match", eCmdHdlrArray, 0 },
 	{ "de_dot", eCmdHdlrBinary, 0 },
-	{ "de_dot_separator", eCmdHdlrString, 0 }
+	{ "de_dot_separator", eCmdHdlrString, 0 },
+	{ "filenameregex", eCmdHdlrString, 0 },
+	{ "containerregex", eCmdHdlrString, 0 }
 };
 static struct cnfparamblk modpblk = {
 	CNFPARAMBLK_VERSION,
@@ -164,7 +179,9 @@ static struct cnfparamdescr actpdescr[] = {
 	{ "tokenfile", eCmdHdlrString, 0 },
 	{ "annotation_match", eCmdHdlrArray, 0 },
 	{ "de_dot", eCmdHdlrBinary, 0 },
-	{ "de_dot_separator", eCmdHdlrString, 0 }
+	{ "de_dot_separator", eCmdHdlrString, 0 },
+	{ "filenameregex", eCmdHdlrString, 0 },
+	{ "containerregex", eCmdHdlrString, 0 }
 };
 static struct cnfparamblk actpblk =
 	{ CNFPARAMBLK_VERSION,
@@ -349,6 +366,8 @@ BEGINsetModCnf
 	struct cnfparamvals *pvals = NULL;
 	int i;
 	FILE *fp;
+	regex_t rx;
+	int ret;
 CODESTARTsetModCnf
 	pvals = nvlstGetParams(lst, &modpblk, NULL);
 	if(pvals == NULL) {
@@ -414,7 +433,6 @@ CODESTARTsetModCnf
 			}
 		} else if(!strcmp(modpblk.descr[i].name, "annotation_match")) {
 			free_annotationmatch(&loadModConf->annotation_match);
-			int ret;
 			if ((ret = init_annotationmatch(&loadModConf->annotation_match, pvals[i].val.d.ar)))
 				ABORT_FINALIZE(ret);
 		} else if(!strcmp(modpblk.descr[i].name, "de_dot")) {
@@ -422,6 +440,34 @@ CODESTARTsetModCnf
 		} else if(!strcmp(modpblk.descr[i].name, "de_dot_separator")) {
 			free(loadModConf->de_dot_separator);
 			loadModConf->de_dot_separator = (uchar *) es_str2cstr(pvals[i].val.d.estr, NULL);
+		} else if(!strcmp(modpblk.descr[i].name, "filenameregex")) {
+			free(loadModConf->fnRegexStr);
+			loadModConf->fnRegexStr = (uchar *) es_str2cstr(pvals[i].val.d.estr, NULL);
+			if((ret = regexp.regcomp(&rx, (char *)loadModConf->fnRegexStr, REG_EXTENDED))) {
+				char errMsg[512];
+				regexp.regerror(ret, &rx, errMsg, sizeof(errMsg));
+				iRet = RS_RET_CONFIG_ERROR;
+				errmsg.LogError(0, iRet,
+						"error: could not compile 'filenameregex' string [%s] into an extended regexp - %d: %s\n",
+						loadModConf->fnRegexStr, ret, errMsg);
+				regexp.regfree(&rx);
+				ABORT_FINALIZE(iRet);
+			}
+			regexp.regfree(&rx);
+		} else if(!strcmp(modpblk.descr[i].name, "containerregex")) {
+			free(loadModConf->contRegexStr);
+			loadModConf->contRegexStr = (uchar *) es_str2cstr(pvals[i].val.d.estr, NULL);
+			if((ret = regexp.regcomp(&rx, (char *)loadModConf->contRegexStr, REG_EXTENDED))) {
+				char errMsg[512];
+				regexp.regerror(ret, &rx, errMsg, sizeof(errMsg));
+				iRet = RS_RET_CONFIG_ERROR;
+				errmsg.LogError(0, iRet,
+						"error: could not compile 'containerregex' string [%s] into an extended regexp - %d: %s\n",
+						loadModConf->contRegexStr, ret, errMsg);
+				regexp.regfree(&rx);
+				ABORT_FINALIZE(iRet);
+			}
+			regexp.regfree(&rx);
 		} else {
 			dbgprintf("mmkubernetes: program error, non-handled "
 				"param '%s' in module() block\n", modpblk.descr[i].name);
@@ -437,6 +483,10 @@ CODESTARTsetModCnf
 	if(loadModConf->de_dot_separator == NULL)
 		loadModConf->de_dot_separator = (uchar *) strdup(DFLT_DE_DOT_SEPARATOR);
 	loadModConf->de_dot_separator_len = strlen((const char *)loadModConf->de_dot_separator);
+	if (loadModConf->fnRegexStr == NULL)
+		loadModConf->fnRegexStr = (uchar *) strdup(DFLT_FILENAME_REGEX);
+	if (loadModConf->contRegexStr == NULL)
+		loadModConf->contRegexStr = (uchar *) strdup(DFLT_CONTAINER_REGEX);
 
 	caches = calloc(1, sizeof(struct cache_s *));
 
@@ -454,14 +504,20 @@ ENDcreateInstance
 BEGINfreeInstance
 CODESTARTfreeInstance
 	free(pData->kubernetesUrl);
-	free(pData->srcMetadataPath);
+	msgPropDescrDestruct(pData->srcMetadataDescr);
+	free(pData->srcMetadataDescr);
 	free(pData->dstMetadataPath);
 	free(pData->caCertFile);
 	free(pData->token);
 	free(pData->tokenFile);
 	regexp.regfree(&pData->fnRegex);
+	regexp.regfree(&pData->contRegex);
 	free_annotationmatch(&pData->annotation_match);
 	free(pData->de_dot_separator);
+	msgPropDescrDestruct(pData->contNameDescr);
+	free(pData->contNameDescr);
+	msgPropDescrDestruct(pData->contIdFullDescr);
+	free(pData->contIdFullDescr);
 ENDfreeInstance
 
 size_t curlCB(char *data, size_t size, size_t nmemb, void *usrptr)
@@ -560,6 +616,10 @@ BEGINnewActInst
 	struct cnfparamvals *pvals = NULL;
 	int i, ret;
 	FILE *fp;
+	char *rxstr = NULL;
+	int haveFnRegex = 0;
+	int haveContRegex = 0;
+	char *srcMetadataPath = NULL;
 CODESTARTnewActInst
 	DBGPRINTF("newActInst (mmkubernetes)\n");
 
@@ -588,8 +648,11 @@ CODESTARTnewActInst
 			free(pData->kubernetesUrl);
 			pData->kubernetesUrl = (uchar *) es_str2cstr(pvals[i].val.d.estr, NULL);
 		} else if(!strcmp(actpblk.descr[i].name, "srcmetadatapath")) {
-			free(pData->srcMetadataPath);
-			pData->srcMetadataPath = (uchar *) es_str2cstr(pvals[i].val.d.estr, NULL);
+			msgPropDescrDestruct(pData->srcMetadataDescr);
+			free(pData->srcMetadataDescr);
+			CHKmalloc(pData->srcMetadataDescr = MALLOC(sizeof(msgPropDescr_t)));
+			srcMetadataPath = es_str2cstr(pvals[i].val.d.estr, NULL);
+			CHKiRet(msgPropDescrFill(pData->srcMetadataDescr, (uchar *)srcMetadataPath, strlen(srcMetadataPath)));
 			/* todo: sanitize the path */
 		} else if(!strcmp(actpblk.descr[i].name, "dstmetadatapath")) {
 			free(pData->dstMetadataPath);
@@ -639,6 +702,40 @@ CODESTARTnewActInst
 		} else if(!strcmp(actpblk.descr[i].name, "de_dot_separator")) {
 			free(pData->de_dot_separator);
 			pData->de_dot_separator = (uchar *) es_str2cstr(pvals[i].val.d.estr, NULL);
+		} else if(!strcmp(actpblk.descr[i].name, "filenameregex")) {
+			regexp.regfree(&pData->fnRegex);
+			rxstr = es_str2cstr(pvals[i].val.d.estr, NULL);
+			if((ret = regexp.regcomp(&pData->fnRegex, rxstr, REG_EXTENDED))) {
+				char errMsg[512];
+				regexp.regerror(ret, &pData->fnRegex, errMsg, sizeof(errMsg));
+				iRet = RS_RET_CONFIG_ERROR;
+				errmsg.LogError(0, iRet,
+						"error: could not compile 'filenameregex' string [%s] into an extended regexp - %d: %s\n",
+						rxstr, ret, errMsg);
+				free(rxstr);
+				rxstr = NULL;
+				ABORT_FINALIZE(iRet);
+			}
+			free(rxstr);
+			rxstr = NULL;
+			haveFnRegex = 1;
+		} else if(!strcmp(actpblk.descr[i].name, "containerregex")) {
+			regexp.regfree(&pData->contRegex);
+			rxstr = es_str2cstr(pvals[i].val.d.estr, NULL);
+			if((ret = regexp.regcomp(&pData->contRegex, rxstr, REG_EXTENDED))) {
+				char errMsg[512];
+				regexp.regerror(ret, &pData->contRegex, errMsg, sizeof(errMsg));
+				iRet = RS_RET_CONFIG_ERROR;
+				errmsg.LogError(0, iRet,
+						"error: could not compile 'containerregex' string [%s] into an extended regexp - %d: %s\n",
+						rxstr, ret, errMsg);
+				free(rxstr);
+				rxstr = NULL;
+				ABORT_FINALIZE(iRet);
+			}
+			free(rxstr);
+			rxstr = NULL;
+			haveContRegex = 1;
 		} else {
 			dbgprintf("mmkubernetes: program error, non-handled "
 				"param '%s' in action() block\n", actpblk.descr[i].name);
@@ -651,8 +748,10 @@ CODESTARTnewActInst
 			ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
 		pData->kubernetesUrl = (uchar *) strdup((char *) loadModConf->kubernetesUrl);
 	}
-	if(pData->srcMetadataPath == NULL)
-		pData->srcMetadataPath = (uchar *) strdup((char *) loadModConf->srcMetadataPath);
+	if(pData->srcMetadataDescr == NULL) {
+		CHKmalloc(pData->srcMetadataDescr = MALLOC(sizeof(msgPropDescr_t)));
+		CHKiRet(msgPropDescrFill(pData->srcMetadataDescr, loadModConf->srcMetadataPath, strlen((char *)loadModConf->srcMetadataPath)));
+	}
 	if(pData->dstMetadataPath == NULL)
 		pData->dstMetadataPath = (uchar *) strdup((char *) loadModConf->dstMetadataPath);
 	if(pData->caCertFile == NULL && loadModConf->caCertFile)
@@ -668,16 +767,30 @@ CODESTARTnewActInst
 
 	pData->de_dot_separator_len = strlen((const char *)pData->de_dot_separator);
 
-	/* todo: make file regexp configurable */
-	if((ret = regexp.regcomp(&pData->fnRegex, DFLT_FILENAME_REGEX, REG_EXTENDED))) {
+	if(!haveFnRegex && (ret = regexp.regcomp(&pData->fnRegex, (char *)loadModConf->fnRegexStr, REG_EXTENDED))) {
 		char errMsg[512];
 		regexp.regerror(ret, &pData->fnRegex, errMsg, sizeof(errMsg));
 		iRet = RS_RET_CONFIG_ERROR;
 		errmsg.LogError(0, iRet,
-				"error: could not compile filename match string [%s] into an extended regexp - %d: %s\n",
-				DFLT_FILENAME_REGEX, ret, errMsg);
+				"error: could not compile 'filenameregex' string [%s] into an extended regexp - %d: %s\n",
+				loadModConf->fnRegexStr, ret, errMsg);
 		ABORT_FINALIZE(iRet);
 	}
+
+	if(!haveContRegex && (ret = regexp.regcomp(&pData->contRegex, (char *)loadModConf->contRegexStr, REG_EXTENDED))) {
+		char errMsg[512];
+		regexp.regerror(ret, &pData->contRegex, errMsg, sizeof(errMsg));
+		iRet = RS_RET_CONFIG_ERROR;
+		errmsg.LogError(0, iRet,
+				"error: could not compile 'containerregex' string [%s] into an extended regexp - %d: %s\n",
+				loadModConf->contRegexStr, ret, errMsg);
+		ABORT_FINALIZE(iRet);
+	}
+
+	CHKmalloc(pData->contNameDescr = MALLOC(sizeof(msgPropDescr_t)));
+	CHKiRet(msgPropDescrFill(pData->contNameDescr, (uchar*) DFLT_CONTAINER_NAME, strlen(DFLT_CONTAINER_NAME)));
+	CHKmalloc(pData->contIdFullDescr = MALLOC(sizeof(msgPropDescr_t)));
+	CHKiRet(msgPropDescrFill(pData->contIdFullDescr, (uchar*) DFLT_CONTAINER_ID_FULL, strlen(DFLT_CONTAINER_NAME)));
 
 	/* get the cache for this url */
 	for(i = 0; caches[i] != NULL; i++) {
@@ -696,6 +809,8 @@ CODESTARTnewActInst
 CODE_STD_FINALIZERnewActInst
 	if(pvals != NULL)
 		cnfparamvalsDestruct(pvals, &actpblk);
+	free(rxstr);
+	free(srcMetadataPath);
 ENDnewActInst
 
 
@@ -740,6 +855,8 @@ CODESTARTfreeCnf
 	free(pModConf->token);
 	free(pModConf->tokenFile);
 	free(pModConf->de_dot_separator);
+	free(pModConf->fnRegexStr);
+	free(pModConf->contRegexStr);
 	free_annotationmatch(&pModConf->annotation_match);
 	for(i = 0; caches[i] != NULL; i++)
 		cacheFree(caches[i]);
@@ -751,7 +868,7 @@ BEGINdbgPrintInstInfo
 CODESTARTdbgPrintInstInfo
 	dbgprintf("mmkubernetes\n");
 	dbgprintf("\tkubernetesUrl='%s'\n", pData->kubernetesUrl);
-	dbgprintf("\tsrcMetadataPath='%s'\n", pData->srcMetadataPath);
+	dbgprintf("\tsrcMetadataPath='%s'\n", pData->srcMetadataDescr->name);
 	dbgprintf("\tdstMetadataPath='%s'\n", pData->dstMetadataPath);
 	dbgprintf("\ttls.cacert='%s'\n", pData->caCertFile);
 	dbgprintf("\tallowUnsignedCerts='%d'\n", pData->allowUnsignedCerts);
@@ -766,28 +883,70 @@ BEGINtryResume
 CODESTARTtryResume
 ENDtryResume
 
-
 static rsRetVal
-extractMsgMetadata(smsg_t *pMsg, uchar *propName, regex_t *fnRegex,
+extractMsgMetadata(smsg_t *pMsg, instanceData *pData,
 	char **podName, char **ns, char **contName, char **dockerID)
 {
 	DEFiRet;
-	msgPropDescr_t prop;
 	char *filename, *p;
 	rs_size_t fnLen;
 	unsigned short freeFn = 0;
 	size_t nmatch = 8, len;
 	regmatch_t pmatch[nmatch];
+	uchar *container_name = NULL;
+	rs_size_t container_name_len;
+	unsigned short free_container_name = 0;
+	uchar *container_id_full = NULL;
+	rs_size_t container_id_full_len;
+	unsigned short free_container_id_full = 0;
+
+	/* extract metadata from the CONTAINER_NAME field and see if CONTAINER_ID_FULL is present */
+	container_name = MsgGetProp(pMsg, NULL, pData->contNameDescr, &container_name_len, &free_container_name, NULL);
+	container_id_full = MsgGetProp(pMsg, NULL, pData->contIdFullDescr, &container_id_full_len, &free_container_id_full, NULL);
+
+	if (container_name && container_id_full && container_name_len && container_id_full_len) {
+		dbgprintf("mmkubernetes: CONTAINER_NAME: '%s'  CONTAINER_ID_FULL: '%s'.\n", container_name, container_id_full);
+		if(REG_NOERROR == regexp.regexec(&pData->contRegex, (char *)container_name, nmatch, pmatch, 0)) {
+			if(pmatch[1].rm_so != -1) {
+				len = pmatch[1].rm_eo - pmatch[1].rm_so;
+				p = malloc(len + 1);
+				memcpy(p, container_name + pmatch[1].rm_so, len);
+				p[len] = '\0';
+				*contName = p;
+			}
+			if(pmatch[4].rm_so != -1) {
+				len = pmatch[4].rm_eo - pmatch[4].rm_so;
+				p = malloc(len + 1);
+				memcpy(p, container_name + pmatch[4].rm_so, len);
+				p[len] = '\0';
+				*podName = p;
+			}
+			if(pmatch[5].rm_so != -1) {
+				len = pmatch[5].rm_eo - pmatch[5].rm_so;
+				p = malloc(len + 1);
+				memcpy(p, container_name + pmatch[5].rm_so, len);
+				p[len] = '\0';
+				*ns = p;
+			}
+			if (free_container_id_full) {
+				/* pass the memory out */
+				*dockerID = (char *)container_id_full;
+				container_id_full = NULL;
+			} else {
+				/* make a copy */
+				*dockerID = strdup((char *)container_id_full);
+			}
+			ABORT_FINALIZE(RS_RET_OK);
+		}
+	}
 
 	/* extract metadata from the file name */
-	msgPropDescrFill(&prop, propName, strlen((char *) propName));
-	filename = (char *) MsgGetProp(pMsg, NULL, &prop, &fnLen, &freeFn, NULL);
+	filename = (char *) MsgGetProp(pMsg, NULL, pData->srcMetadataDescr, &fnLen, &freeFn, NULL);
 	dbgprintf("mmkubernetes: filename: '%s'.\n", filename);
-	msgPropDescrDestruct(&prop);
 	if(filename == NULL)
 		ABORT_FINALIZE(RS_RET_NOT_FOUND);
 
-	if(REG_NOMATCH == regexp.regexec(fnRegex, filename, nmatch, pmatch, 0))
+	if(REG_NOMATCH == regexp.regexec(&pData->fnRegex, filename, nmatch, pmatch, 0))
 		ABORT_FINALIZE(RS_RET_NOT_FOUND);
 
 	if(pmatch[1].rm_so != -1) {
@@ -822,6 +981,10 @@ extractMsgMetadata(smsg_t *pMsg, uchar *propName, regex_t *fnRegex,
 finalize_it:
 	if(freeFn)
 		free(filename);
+	if (free_container_name)
+		free(container_name);
+	if (free_container_id_full)
+		free(container_id_full);
 	RETiRet;
 }
 
@@ -887,8 +1050,8 @@ BEGINdoAction
 		*dockerID = NULL, *mdKey = NULL;
 	struct json_object *jMetadata = NULL;
 CODESTARTdoAction
-	CHKiRet_Hdlr(extractMsgMetadata(pMsg, pWrkrData->pData->srcMetadataPath,
-		&pWrkrData->pData->fnRegex, &podName, &ns, &containerName, &dockerID)) {
+	CHKiRet_Hdlr(extractMsgMetadata(pMsg, pWrkrData->pData,
+				 &podName, &ns, &containerName, &dockerID)) {
 		ABORT_FINALIZE((iRet == RS_RET_NOT_FOUND) ? RS_RET_OK : iRet);
 	}
 
