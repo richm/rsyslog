@@ -1048,7 +1048,8 @@ BEGINdoAction
 #endif
 	char *podName = NULL, *ns = NULL, *containerName = NULL,
 		*dockerID = NULL, *mdKey = NULL;
-	struct json_object *jMetadata = NULL;
+	struct json_object *jMetadata = NULL, *jMetadataCopy = NULL;
+	int add_ns_metadata = 0;
 CODESTARTdoAction
 	CHKiRet_Hdlr(extractMsgMetadata(pMsg, pWrkrData->pData,
 				 &podName, &ns, &containerName, &dockerID)) {
@@ -1074,7 +1075,6 @@ CODESTARTdoAction
 
 		/* check cache for namespace metadata */
 		jNsMeta = hashtable_search(pWrkrData->pData->cache->nsHt, ns);
-		pthread_mutex_unlock(pWrkrData->pData->cache->cacheMtx);
 
 		if(jNsMeta == NULL) {
 			/* query kubernetes for namespace info */
@@ -1083,14 +1083,23 @@ CODESTARTdoAction
 				 (char *) pWrkrData->pData->kubernetesUrl, ns);
 			iRet = queryKB(pWrkrData, url, &jReply);
 			free(url);
-			/* todo: opt to ignore the missing uid? */
-			CHKiRet(iRet);
+			/* todo: implement support for the .orphaned namespace */
+			if (iRet != RS_RET_OK) {
+				json_object_put(jReply);
+				jReply = NULL;
+				pthread_mutex_unlock(pWrkrData->pData->cache->cacheMtx);
+				FINALIZE;
+			}
 
 			if(fjson_object_object_get_ex(jReply, "metadata", &jNsMeta)) {
 				jNsMeta = json_object_get(jNsMeta);
 				parse_labels_annotations(jNsMeta, &pWrkrData->pData->annotation_match, pWrkrData->pData->de_dot,
 										 (const char *)pWrkrData->pData->de_dot_separator, pWrkrData->pData->de_dot_separator_len);
+				add_ns_metadata = 1;
 			} else {
+				/* namespace with no metadata??? */
+				errmsg.LogMsg(0, RS_RET_ERR, LOG_INFO,
+						      "mmkubernetes: namespace [%s] has no metadata!\n", ns);
 				jNsMeta = NULL;
 			}
 
@@ -1103,17 +1112,13 @@ CODESTARTdoAction
 		iRet = queryKB(pWrkrData, url, &jReply);
 		free(url);
 		if(iRet != RS_RET_OK) {
-			/* todo: it is wrong to access jNsMeta outside of the mutex if it was
-			 * obtained from the cache
-			 */
-			if(jNsMeta) {
-				pthread_mutex_lock(pWrkrData->pData->cache->cacheMtx);
+			if(jNsMeta && add_ns_metadata) {
 				hashtable_insert(pWrkrData->pData->cache->nsHt, ns, jNsMeta);
 				ns = NULL;
-				pthread_mutex_unlock(pWrkrData->pData->cache->cacheMtx);
 			}
 			json_object_put(jReply);
 			jReply = NULL;
+			pthread_mutex_unlock(pWrkrData->pData->cache->cacheMtx);
 			FINALIZE;
 		}
 
@@ -1152,21 +1157,25 @@ CODESTARTdoAction
 		json_object_object_add(jo, "container_id", json_object_new_string(dockerID));
 		json_object_object_add(jMetadata, "docker", jo);
 
-		pthread_mutex_lock(pWrkrData->pData->cache->cacheMtx);
 		hashtable_insert(pWrkrData->pData->cache->mdHt, mdKey, jMetadata);
 		mdKey = NULL;
 		if(jNsMeta) {
+			/* todo: what if ns is already hashed? */
 			hashtable_insert(pWrkrData->pData->cache->nsHt, ns, jNsMeta);
 			ns = NULL;
 		}
-		pthread_mutex_unlock(pWrkrData->pData->cache->cacheMtx);
-	} else {
-		pthread_mutex_unlock(pWrkrData->pData->cache->cacheMtx);
 	}
 
+	/* make a copy of the metadata for the msg to own */
+	/* todo: use json_object_deep_copy when implementation available in libfastjson */
+	/* yes, this is expensive - but there is no other way to make this thread safe - we
+	 * can't allow the msg to have a shared pointer to an element inside the cache,
+	 * outside of the cache lock
+	 */
+	jMetadataCopy = json_tokener_parse(json_object_get_string(jMetadata));
+	pthread_mutex_unlock(pWrkrData->pData->cache->cacheMtx);
 	/* the +1 is there to skip the leading '$' */
-	/* todo: I think access to jMetadata, even read-only access, must be done with the cache lock held */
-	msgAddJSON(pMsg, (uchar *) pWrkrData->pData->dstMetadataPath + 1, json_object_get(jMetadata), 0, 0);
+	msgAddJSON(pMsg, (uchar *) pWrkrData->pData->dstMetadataPath + 1, jMetadataCopy, 0, 0);
 
 finalize_it:
 	free(podName);
