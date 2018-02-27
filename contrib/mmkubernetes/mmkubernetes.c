@@ -82,7 +82,7 @@ DEFobjCurrIf(regexp)
  */
 #define DFLT_CONTAINER_REGEX "^[^_]+_([^\\._]+)(\\.([^_]+))?_([^_]+)_([^_]+)_[^_]+_[^_]+$"
 #define DFLT_SRCMD_PATH "$!metadata!filename"
-#define DFLT_DSTMD_PATH "$!metadata"
+#define DFLT_DSTMD_PATH "$!"
 #define DFLT_DE_DOT 1 /* true */
 #define DFLT_DE_DOT_SEPARATOR "_"
 #define DFLT_CONTAINER_NAME "$!CONTAINER_NAME" /**< name of variable holding CONTAINER_NAME value */
