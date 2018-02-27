@@ -251,26 +251,28 @@ finalize_it:
 }
 
 /* takes a hash of annotations and returns another json object hash containing only the
- * keys that match
+ * keys that match - this logic is taken directly from fluent-plugin-kubernetes_metadata_filter
+ * except that we do not add the key multiple times to the object to be returned
  */
 static struct json_object *match_annotations(annotation_match_t *match, struct json_object *annotations) {
 	struct json_object *ret = NULL;
-	struct json_object_iterator it = json_object_iter_begin(annotations);
-	struct json_object_iterator itEnd = json_object_iter_end(annotations);
 	size_t nmatch = 0; /* ignored REG_NOSUB */
 	regmatch_t pmatch[nmatch]; /* ignored REG_NOSUB */
 
-	while (!json_object_iter_equal(&it, &itEnd)) {
-		const char *const key = json_object_iter_peek_name(&it);
-		for (int jj = 0; jj < match->nmemb; ++jj) {
-			if (!regexp.regexec(&match->regexps[jj], key, nmatch, pmatch, 0)) {
-				if (!ret) {
-					ret = json_object_new_object();
+	for (int jj = 0; jj < match->nmemb; ++jj) {
+		struct json_object_iterator it = json_object_iter_begin(annotations);
+		struct json_object_iterator itEnd = json_object_iter_end(annotations);
+		for (;!json_object_iter_equal(&it, &itEnd); json_object_iter_next(&it)) {
+			const char *const key = json_object_iter_peek_name(&it);
+			if (!ret || !fjson_object_object_get_ex(ret, key, NULL)) {
+				if (!regexp.regexec(&match->regexps[jj], key, nmatch, pmatch, 0)) {
+					if (!ret) {
+						ret = json_object_new_object();
+					}
+					json_object_object_add(ret, key, json_object_get(json_object_iter_peek_value(&it)));
 				}
-				json_object_object_add(ret, key, json_object_get(json_object_iter_peek_value(&it)));
 			}
 		}
-		json_object_iter_next(&it);
 	}
 	return ret;
 }
@@ -342,14 +344,15 @@ static void parse_labels_annotations(struct json_object *jMetadata, annotation_m
 	}
 	/* dedot labels and annotations */
 	if (de_dot) {
+		struct json_object *jo2 = NULL;
 		if (fjson_object_object_get_ex(jMetadata, "annotations", &jo)) {
-			if ((jo = de_dot_json_object(jo, delim, delim_len))) {
-				json_object_object_add(jMetadata, "annotations", jo);
+			if ((jo2 = de_dot_json_object(jo, delim, delim_len))) {
+				json_object_object_add(jMetadata, "annotations", jo2);
 			}
 		}
 		if (fjson_object_object_get_ex(jMetadata, "labels", &jo)) {
-			if ((jo = de_dot_json_object(jo, delim, delim_len))) {
-				json_object_object_add(jMetadata, "labels", jo);
+			if ((jo2 = de_dot_json_object(jo, delim, delim_len))) {
+				json_object_object_add(jMetadata, "labels", jo2);
 			}
 		}
 	}
@@ -1159,8 +1162,7 @@ CODESTARTdoAction
 
 		hashtable_insert(pWrkrData->pData->cache->mdHt, mdKey, jMetadata);
 		mdKey = NULL;
-		if(jNsMeta) {
-			/* todo: what if ns is already hashed? */
+		if(jNsMeta && add_ns_metadata) {
 			hashtable_insert(pWrkrData->pData->cache->nsHt, ns, jNsMeta);
 			ns = NULL;
 		}
