@@ -733,25 +733,33 @@ CODESTARTcreateWrkrInstance
 	CURL *ctx;
 	struct curl_slist *hdr = NULL;
 	char *tokenHdr = NULL;
-	FILE *fp;
+	FILE *fp = NULL;
+	char *token = NULL;
 
 	hdr = curl_slist_append(hdr, "Content-Type: text/json; charset=utf-8");
 	if (pWrkrData->pData->token) {
-		asprintf(&tokenHdr, "Authorization: Bearer %s", pWrkrData->pData->token);
+		if ((-1 == asprintf(&tokenHdr, "Authorization: Bearer %s", pWrkrData->pData->token)) ||
+			(!tokenHdr)) {
+			ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+		}
 	} else if (pWrkrData->pData->tokenFile) {
 		struct stat statbuf;
-		char *token = NULL;
 		fp = fopen((const char*)pWrkrData->pData->tokenFile, "r");
 		if (fp && !fstat(fileno(fp), &statbuf)) {
 			size_t bytesread;
-			token = malloc((statbuf.st_size+1)*sizeof(char));
+			CHKmalloc(token = malloc((statbuf.st_size+1)*sizeof(char)));
 			if (0 < (bytesread = fread(token, sizeof(char), statbuf.st_size, fp))) {
 				token[bytesread] = '\0';
-				asprintf(&tokenHdr, "Authorization: Bearer %s", token);
+				if ((-1 == asprintf(&tokenHdr, "Authorization: Bearer %s", token)) ||
+					(!tokenHdr)) {
+					ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+				}
 			}
 			free(token);
+			token = NULL;
 		}
 		fclose(fp);
+		fp = NULL;
 	}
 	if (tokenHdr) {
 		hdr = curl_slist_append(hdr, tokenHdr);
@@ -768,6 +776,11 @@ CODESTARTcreateWrkrInstance
 		curl_easy_setopt(ctx, CURLOPT_SSL_VERIFYPEER, 0);
 
 	pWrkrData->curlCtx = ctx;
+finalize_it:
+	free(token);
+	if (fp) {
+		fclose(fp);
+	}
 ENDcreateWrkrInstance
 
 
@@ -1244,7 +1257,10 @@ CODESTARTdoAction
 		"  containerID: '%s'\n", podName, ns, containerName, containerID);
 
 	/* check cache for metadata */
-	asprintf(&mdKey, "%s_%s_%s", ns, podName, containerName);
+	if ((-1 == asprintf(&mdKey, "%s_%s_%s", ns, podName, containerName)) ||
+		(!mdKey)) {
+		ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+	}
 	pthread_mutex_lock(pWrkrData->pData->cache->cacheMtx);
 	jMetadata = hashtable_search(pWrkrData->pData->cache->mdHt, mdKey);
 
@@ -1258,8 +1274,12 @@ CODESTARTdoAction
 		if(jNsMeta == NULL) {
 			/* query kubernetes for namespace info */
 			/* todo: move url definitions elsewhere */
-			asprintf(&url, "%s/api/v1/namespaces/%s",
-				 (char *) pWrkrData->pData->kubernetesUrl, ns);
+			if ((-1 == asprintf(&url, "%s/api/v1/namespaces/%s",
+				 (char *) pWrkrData->pData->kubernetesUrl, ns)) ||
+				(!url)) {
+				pthread_mutex_unlock(pWrkrData->pData->cache->cacheMtx);
+				ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+			}
 			iRet = queryKB(pWrkrData, url, &jReply);
 			free(url);
 			/* todo: implement support for the .orphaned namespace */
@@ -1288,8 +1308,12 @@ CODESTARTdoAction
 			jReply = NULL;
 		}
 
-		asprintf(&url, "%s/api/v1/namespaces/%s/pods/%s",
-			 (char *) pWrkrData->pData->kubernetesUrl, ns, podName);
+		if ((-1 == asprintf(&url, "%s/api/v1/namespaces/%s/pods/%s",
+			 (char *) pWrkrData->pData->kubernetesUrl, ns, podName)) ||
+			(!url)) {
+			pthread_mutex_unlock(pWrkrData->pData->cache->cacheMtx);
+			ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+		}
 		iRet = queryKB(pWrkrData, url, &jReply);
 		free(url);
 		if(iRet != RS_RET_OK) {
