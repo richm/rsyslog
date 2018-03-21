@@ -1250,7 +1250,7 @@ CODESTARTdoAction
 
 	if(jMetadata == NULL) {
 		char *url = NULL;
-		struct json_object *jReply = NULL, *jo2 = NULL, *jNsMeta = NULL;
+		struct json_object *jReply = NULL, *jo2 = NULL, *jNsMeta = NULL, *jPodData = NULL;
 
 		/* check cache for namespace metadata */
 		jNsMeta = hashtable_search(pWrkrData->pData->cache->nsHt, (char *)ns);
@@ -1311,20 +1311,22 @@ CODESTARTdoAction
 			json_object_object_add(jo, "namespace_annotations", json_object_get(jo2));
 		if(jNsMeta && fjson_object_object_get_ex(jNsMeta, "creationTimestamp", &jo2))
 			json_object_object_add(jo, "creation_timestamp", json_object_get(jo2));
-		if(fjson_object_object_get_ex(jReply, "nodeName", &jo2))
-			json_object_object_add(jo, "host", json_object_get(jo2));
-		if(fjson_object_object_get_ex(jReply, "uid", &jo2))
-			json_object_object_add(jo, "pod_id", json_object_get(jo2));
-		if(fjson_object_object_get_ex(jReply, "metadata", &jo2)) {
-			struct json_object *jo3 = NULL;
-			parse_labels_annotations(jo2, &pWrkrData->pData->annotation_match,
+		if(fjson_object_object_get_ex(jReply, "metadata", &jPodData)) {
+			if(fjson_object_object_get_ex(jPodData, "uid", &jo2))
+				json_object_object_add(jo, "pod_id", json_object_get(jo2));
+			parse_labels_annotations(jPodData, &pWrkrData->pData->annotation_match,
 				pWrkrData->pData->de_dot,
 				(const char *)pWrkrData->pData->de_dot_separator,
 				pWrkrData->pData->de_dot_separator_len);
-			if(fjson_object_object_get_ex(jo2, "annotations", &jo3))
-				json_object_object_add(jo, "annotations", json_object_get(jo3));
-			if(fjson_object_object_get_ex(jo2, "labels", &jo3))
-				json_object_object_add(jo, "labels", json_object_get(jo3));
+			if(fjson_object_object_get_ex(jPodData, "annotations", &jo2))
+				json_object_object_add(jo, "annotations", json_object_get(jo2));
+			if(fjson_object_object_get_ex(jPodData, "labels", &jo2))
+				json_object_object_add(jo, "labels", json_object_get(jo2));
+		}
+		if(fjson_object_object_get_ex(jReply, "spec", &jPodData)) {
+			if(fjson_object_object_get_ex(jPodData, "nodeName", &jo2)) {
+				json_object_object_add(jo, "host", json_object_get(jo2));
+			}
 		}
 		json_object_put(jReply);
 		jReply = NULL;
