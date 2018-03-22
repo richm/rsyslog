@@ -27,32 +27,6 @@
  * limitations under the License.
  */
 
-/* todo: needed for MVP
- * - cache cleanup
- *   - allow setting cache size, cache element ttl
- * - SIGHUP handling - to clear cache and reconfigure
- * - missing configuration options
- *   - watch - set up watches to instantly refresh (add,mod,delete) pod and namespace
- *             metadata when changed on the server
- *   - include_namespace_metadata - allow disabling the use of namespace metadata
- *   - allow_orphans, orphaned_namespace_name, orphaned_namespace_id
- *     when the namespace is not found, the record should still be processed - allow the
- *     user to specify a special namespace name and id for "orphaned" records
- * - documentation
- * - smarter caching
- *   - the fluentd plugin has much more sophisticated caching, and
- *     can identify the metadata to use for records even if the data has been deleted
- *     from the server, if the data is still cached
- */
-
-/* todo: for future enhancements
- * - missing configuration options
- *   - apiversion - k8s api version
- *   - client_cert, client_key for client cert auth
- * - batching
- * - failover - allow specifying multiple kubernetesurl
- */
-
 /* needed for asprintf */
 #ifndef _GNU_SOURCE
 #  define _GNU_SOURCE
