@@ -1092,6 +1092,7 @@ extractMsgMetadata(smsg_t *pMsg, instanceData *pData, struct json_object **json)
 	rs_size_t fnLen, container_name_len, container_id_full_len;
 	unsigned short freeFn = 0, free_container_name = 0, free_container_id_full = 0;
 	int lnret;
+	struct json_object *cnid = NULL;
 
 	if (!json)
 		FINALIZE;
@@ -1116,7 +1117,8 @@ extractMsgMetadata(smsg_t *pMsg, instanceData *pData, struct json_object **json)
 			fjson_object_object_get_ex(*json, "container_name", NULL)) {
 			/* add field for container id */
 			json_object_object_add(*json, "container_id",
-					json_object_new_string((const char *)container_id_full));
+					json_object_new_string_len((const char *)container_id_full,
+											   container_id_full_len));
 			ABORT_FINALIZE(RS_RET_OK);
 		}
 	}
@@ -1134,9 +1136,19 @@ extractMsgMetadata(smsg_t *pMsg, instanceData *pData, struct json_object **json)
 	 * and container id, we are good to go */
 	if (fjson_object_object_get_ex(*json, "pod_name", NULL) &&
 		fjson_object_object_get_ex(*json, "namespace_name", NULL) &&
-		fjson_object_object_get_ex(*json, "container_name", NULL) &&
-		fjson_object_object_get_ex(*json, "container_id", NULL)) {
-		ABORT_FINALIZE(RS_RET_OK);
+		fjson_object_object_get_ex(*json, "container_name_and_id", &cnid)) {
+		/* parse container_name_and_id into container_name and container_id */
+		const char *container_name_and_id = json_object_get_string(cnid);
+		const char *last_dash = NULL;
+		if (container_name_and_id && (last_dash = strrchr(container_name_and_id, '-')) &&
+			*(last_dash + 1) && (last_dash != container_name_and_id)) {
+			json_object_object_add(*json, "container_name",
+					json_object_new_string_len(container_name_and_id,
+											   (int)(last_dash-container_name_and_id)));
+			json_object_object_add(*json, "container_id",
+					json_object_new_string(last_dash + 1));
+			ABORT_FINALIZE(RS_RET_OK);
+		}
 	}
 	ABORT_FINALIZE(RS_RET_NOT_FOUND);
 finalize_it:
