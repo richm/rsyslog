@@ -687,18 +687,23 @@ CODESTARTfreeInstance
 	free(pData->contIdFullDescr);
 ENDfreeInstance
 
-size_t curlCB(char *data, size_t size, size_t nmemb, void *usrptr)
+static size_t curlCB(char *data, size_t size, size_t nmemb, void *usrptr)
 {
+	DEFiRet;
 	wrkrInstanceData_t *pWrkrData = (wrkrInstanceData_t *) usrptr;
 	char * buf;
 	size_t newlen;
 
 	newlen = pWrkrData->curlRplyLen + size * nmemb;
-	buf = realloc(pWrkrData->curlRply, newlen);
+	CHKmalloc(buf = realloc(pWrkrData->curlRply, newlen));
 	memcpy(buf + pWrkrData->curlRplyLen, data, size * nmemb);
 	pWrkrData->curlRply = buf;
 	pWrkrData->curlRplyLen = newlen;
 
+finalize_it:
+	if (iRet != RS_RET_OK) {
+		return 0;
+	}
 	return size * nmemb;
 }
 
@@ -769,7 +774,9 @@ static struct cache_s *cacheNew(const uchar *url)
 {
 	struct cache_s *cache;
 
-	cache = calloc(1, sizeof(struct cache_s));
+	if (NULL == (cache = calloc(1, sizeof(struct cache_s)))) {
+		goto finalize_it;
+	}
 	cache->kbUrl = url;
 	cache->mdHt = create_hashtable(100, hash_from_string,
 		key_equals_string, (void (*)(void *)) json_object_put);
@@ -778,6 +785,7 @@ static struct cache_s *cacheNew(const uchar *url)
 	cache->cacheMtx = malloc(sizeof(pthread_mutex_t));
 	pthread_mutex_init(cache->cacheMtx, NULL);
 
+finalize_it:
 	return cache;
 }
 
@@ -987,7 +995,7 @@ CODESTARTnewActInst
 	} else {
 		pData->cache = cacheNew(pData->kubernetesUrl);
 
-		caches = realloc(caches, (i + 2) * sizeof(struct cache_s *));
+		CHKmalloc(caches = realloc(caches, (i + 2) * sizeof(struct cache_s *)));
 		caches[i] = pData->cache;
 		caches[i + 1] = NULL;
 	}
