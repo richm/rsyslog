@@ -622,12 +622,12 @@ CODESTARTsetModCnf
 #if HAVE_LOADSAMPLESFROMSTRING == 1
 	if (loadModConf->fnRules && loadModConf->fnRulebase) {
 		errmsg.LogError(0, RS_RET_CONFIG_ERROR,
-					"mmkubernetes: only 1 of filenamerules or filenamerulebase may be used");
+				"mmkubernetes: only 1 of filenamerules or filenamerulebase may be used");
 		ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
 	}
 	if (loadModConf->contRules && loadModConf->contRulebase) {
 		errmsg.LogError(0, RS_RET_CONFIG_ERROR,
-					"mmkubernetes: only 1 of containerrules or containerrulebase may be used");
+				"mmkubernetes: only 1 of containerrules or containerrulebase may be used");
 		ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
 	}
 #endif
@@ -1099,15 +1099,15 @@ extractMsgMetadata(smsg_t *pMsg, instanceData *pData, struct json_object **json)
 	*json = NULL;
 	/* extract metadata from the CONTAINER_NAME field and see if CONTAINER_ID_FULL is present */
 	container_name = MsgGetProp(pMsg, NULL, pData->contNameDescr,
-								&container_name_len, &free_container_name, NULL);
+				    &container_name_len, &free_container_name, NULL);
 	container_id_full = MsgGetProp(
 		pMsg, NULL, pData->contIdFullDescr, &container_id_full_len, &free_container_id_full, NULL);
 
 	if (container_name && container_id_full && container_name_len && container_id_full_len) {
 		dbgprintf("mmkubernetes: CONTAINER_NAME: '%s'  CONTAINER_ID_FULL: '%s'.\n",
-			container_name, container_id_full);
+			  container_name, container_id_full);
 		if ((lnret = ln_normalize(pData->contCtxln, (char*)container_name,
-				container_name_len, json))) {
+					  container_name_len, json))) {
 			ABORT_FINALIZE(RS_RET_ERR);
 		}
 		/* if we have fields for pod name, namespace name, container name,
@@ -1117,8 +1117,8 @@ extractMsgMetadata(smsg_t *pMsg, instanceData *pData, struct json_object **json)
 			fjson_object_object_get_ex(*json, "container_name", NULL)) {
 			/* add field for container id */
 			json_object_object_add(*json, "container_id",
-					json_object_new_string_len((const char *)container_id_full,
-											   container_id_full_len));
+				json_object_new_string_len((const char *)container_id_full,
+							   container_id_full_len));
 			ABORT_FINALIZE(RS_RET_OK);
 		}
 	}
@@ -1143,8 +1143,8 @@ extractMsgMetadata(smsg_t *pMsg, instanceData *pData, struct json_object **json)
 		if (container_name_and_id && (last_dash = strrchr(container_name_and_id, '-')) &&
 			*(last_dash + 1) && (last_dash != container_name_and_id)) {
 			json_object_object_add(*json, "container_name",
-					json_object_new_string_len(container_name_and_id,
-											   (int)(last_dash-container_name_and_id)));
+				json_object_new_string_len(container_name_and_id,
+							   (int)(last_dash-container_name_and_id)));
 			json_object_object_add(*json, "container_id",
 					json_object_new_string(last_dash + 1));
 			ABORT_FINALIZE(RS_RET_OK);
@@ -1180,8 +1180,8 @@ queryKB(wrkrInstanceData_t *pWrkrData, char *url, struct json_object **rply)
 		ABORT_FINALIZE(RS_RET_ERR);
 	if (CURLE_OK != (ccode = curl_easy_perform(pWrkrData->curlCtx))) {
 		errmsg.LogMsg(0, RS_RET_ERR, LOG_ERR,
-				      "mmkubernetes: failed to connect to [%s] - %d:%s\n",
-				      url, ccode, curl_easy_strerror(ccode));
+			      "mmkubernetes: failed to connect to [%s] - %d:%s\n",
+			      url, ccode, curl_easy_strerror(ccode));
 		ABORT_FINALIZE(RS_RET_ERR);
 	}
 
@@ -1194,8 +1194,8 @@ queryKB(wrkrInstanceData_t *pWrkrData, char *url, struct json_object **rply)
 		json_object_put(jo);
 		jo = NULL;
 		errmsg.LogMsg(0, RS_RET_JSON_PARSE_ERR, LOG_INFO,
-				      "mmkubernetes: unable to parse string as JSON:[%.*s]\n",
-					  (int)pWrkrData->curlRplyLen, pWrkrData->curlRply);
+			      "mmkubernetes: unable to parse string as JSON:[%.*s]\n",
+			      (int)pWrkrData->curlRplyLen, pWrkrData->curlRply);
 		ABORT_FINALIZE(RS_RET_JSON_PARSE_ERR);
 	}
 
@@ -1294,7 +1294,7 @@ CODESTARTdoAction
 			} else {
 				/* namespace with no metadata??? */
 				errmsg.LogMsg(0, RS_RET_ERR, LOG_INFO,
-						      "mmkubernetes: namespace [%s] has no metadata!\n", ns);
+					      "mmkubernetes: namespace [%s] has no metadata!\n", ns);
 				jNsMeta = NULL;
 			}
 
