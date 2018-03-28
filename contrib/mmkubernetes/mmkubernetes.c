@@ -287,8 +287,6 @@ finalize_it:
 static struct json_object *match_annotations(annotation_match_t *match,
 		struct json_object *annotations) {
 	struct json_object *ret = NULL;
-	size_t nmatch = 0; /* ignored REG_NOSUB */
-	regmatch_t pmatch[nmatch]; /* ignored REG_NOSUB */
 
 	for (int jj = 0; jj < match->nmemb; ++jj) {
 		struct json_object_iterator it = json_object_iter_begin(annotations);
@@ -296,7 +294,7 @@ static struct json_object *match_annotations(annotation_match_t *match,
 		for (;!json_object_iter_equal(&it, &itEnd); json_object_iter_next(&it)) {
 			const char *const key = json_object_iter_peek_name(&it);
 			if (!ret || !fjson_object_object_get_ex(ret, key, NULL)) {
-				if (!regexp.regexec(&match->regexps[jj], key, nmatch, pmatch, 0)) {
+				if (!regexp.regexec(&match->regexps[jj], key, 0, NULL, 0)) {
 					if (!ret) {
 						ret = json_object_new_object();
 					}
@@ -639,7 +637,8 @@ CODESTARTsetModCnf
 		loadModConf->dstMetadataPath = (uchar *) strdup(DFLT_DSTMD_PATH);
 	if(loadModConf->de_dot_separator == NULL)
 		loadModConf->de_dot_separator = (uchar *) strdup(DFLT_DE_DOT_SEPARATOR);
-	loadModConf->de_dot_separator_len = strlen((const char *)loadModConf->de_dot_separator);
+	if(loadModConf->de_dot_separator)
+		loadModConf->de_dot_separator_len = strlen((const char *)loadModConf->de_dot_separator);
 #if HAVE_LOADSAMPLESFROMSTRING == 1
 	if (loadModConf->fnRules == NULL && loadModConf->fnRulebase == NULL)
 		loadModConf->fnRules = strdup(DFLT_FILENAME_LNRULES);
@@ -976,7 +975,8 @@ CODESTARTnewActInst
 	if((pData->annotation_match.nmemb == 0) && (loadModConf->annotation_match.nmemb > 0))
 		copy_annotationmatch(&loadModConf->annotation_match, &pData->annotation_match);
 
-	pData->de_dot_separator_len = strlen((const char *)pData->de_dot_separator);
+	if(pData->de_dot_separator)
+		pData->de_dot_separator_len = strlen((const char *)pData->de_dot_separator);
 
 	CHKmalloc(pData->contNameDescr = MALLOC(sizeof(msgPropDescr_t)));
 	CHKiRet(msgPropDescrFill(pData->contNameDescr, (uchar*) DFLT_CONTAINER_NAME,
