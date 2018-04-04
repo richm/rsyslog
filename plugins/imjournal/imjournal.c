@@ -78,6 +78,7 @@ static struct configSettings_s {
 	int iDfltSeverity;
 	int iDfltFacility;
 	int bUseJnlPID;
+	char *dfltTag;
 } cs;
 
 static rsRetVal facilityHdlr(uchar **pp, void *pVal);
@@ -93,6 +94,7 @@ static struct cnfparamdescr modpdescr[] = {
 	{ "defaultseverity", eCmdHdlrSeverity, 0 },
 	{ "defaultfacility", eCmdHdlrString, 0 },
 	{ "usepidfromsystem", eCmdHdlrBinary, 0 },
+	{ "defaulttag", eCmdHdlrGetWord, 0 },
 };
 static struct cnfparamblk modpblk =
 	{ CNFPARAMBLK_VERSION,
@@ -103,6 +105,7 @@ static struct cnfparamblk modpblk =
 #define DFLT_persiststateinterval 10
 #define DFLT_SEVERITY pri2sev(LOG_NOTICE)
 #define DFLT_FACILITY pri2fac(LOG_USER)
+#define DFLT_TAG "journal"
 
 static int bLegacyCnfModGlobalsPermitted = 1;/* are legacy module-global config parameters permitted? */
 
@@ -213,8 +216,13 @@ enqMsg(uchar *msg, uchar *pszTag, int iFacility, int iSeverity, struct timeval *
 	}
 	MsgSetFlowControlType(pMsg, eFLOWCTL_LIGHT_DELAY);
 	MsgSetInputName(pMsg, pInputName);
+	/* Recalculating the message length shouldn't cause problems as all
+ 	 * potential zero-bytes have been excaped in sanitizeValue(). */ 	
 	len = strlen((char*)msg);
 	MsgSetRawMsg(pMsg, (char*)msg, len);
+	/* NB: SanitizeMsg() only touches the raw message and its
+ 	 * length which only contain the msg part. Thus the TAG and
+ 	 * other fields are not sanitized. */ 
 	if(len > 0)
 		parser.SanitizeMsg(pMsg);
 	MsgSetMSGoffs(pMsg, 0);	/* we do not have a header... */
@@ -252,7 +260,7 @@ readjournal(void)
 
 	/* Information from messages */
 	char *message = NULL;
-	char *sys_iden;
+	char *sys_iden = NULL;
 	char *sys_iden_help = NULL;
 
 	const void *get;
@@ -313,29 +321,34 @@ readjournal(void)
 	/* Get message identifier, client pid and add ':' */
 	if (sd_journal_get_data(j, "SYSLOG_IDENTIFIER", &get, &length) >= 0) {
 		CHKiRet(sanitizeValue(((const char *)get) + 18, length - 18, &sys_iden));
-	} else {
-		CHKmalloc(sys_iden = strdup("journal"));
 	}
 
-	if (sd_journal_get_data(j, pid_field_name, &pidget, &pidlength) >= 0) {
-		char *sys_pid;
-		int val_ofs;
-
-		val_ofs = strlen(pid_field_name) + 1; /* name + '=' */
-		CHKiRet_Hdlr(sanitizeValue(((const char *)pidget) + val_ofs, pidlength - val_ofs, &sys_pid)) {
-			free (sys_iden);
-			FINALIZE;
+	if (sys_iden == NULL && !cs.dfltTag[0]) {
+               /* This is a special case: if no tag was obtained from
+                * the message and the user has set the default tag to
+                * an empty string, nothing is inserted.
+                */
+               CHKmalloc(sys_iden_help = calloc(1, 1));
+       	} else {
+        	if (sys_iden == NULL) {
+                	/* Use a predefined tag if it can't be obtained from the message */
+                        CHKmalloc(sys_iden = strdup(cs.dfltTag));
+               	}
+               	if (sd_journal_get_data(j, "SYSLOG_PID", &pidget, &pidlength) >= 0) {
+                	char *sys_pid;
+                        CHKiRet_Hdlr(sanitizeValue(((const char *)pidget) + 11, pidlength - 11, &sys_pid)) {
+                                free (sys_iden);
+                                FINALIZE;
+                        }
+                        r = asprintf(&sys_iden_help, "%s[%s]:", sys_iden, sys_pid);
+                        free (sys_pid);
+                } else {
+                        r = asprintf(&sys_iden_help, "%s:", sys_iden);
 		}
-		r = asprintf(&sys_iden_help, "%s[%s]:", sys_iden, sys_pid);
-		free (sys_pid);
-	} else {
-		r = asprintf(&sys_iden_help, "%s:", sys_iden);
-	}
-
-	free (sys_iden);
-
-	if (-1 == r) {
-		ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+		free (sys_iden);
+		if (-1 == r) {
+			ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+		}
 	}
 
 	json = json_object_new_object();
@@ -643,6 +656,10 @@ CODESTARTrunInput
 		pid_field_name = "SYSLOG_PID";
 	}
 
+	if (cs.dfltTag == NULL) {
+		cs.dfltTag = strdup(DFLT_TAG);
+	}
+
 	/* this is an endless loop - it is terminated when the thread is
 	 * signalled to do so. This, however, is handled by the framework.
 	 */
@@ -691,6 +708,7 @@ CODESTARTbeginCnfLoad
 	cs.ratelimitInterval = 600;
 	cs.iDfltSeverity = DFLT_SEVERITY;
 	cs.iDfltFacility = DFLT_FACILITY;
+	cs.dfltTag = NULL;
 	cs.bUseJnlPID = 0;
 ENDbeginCnfLoad
 
@@ -713,6 +731,7 @@ ENDactivateCnf
 BEGINfreeCnf
 CODESTARTfreeCnf
 	free(cs.stateFile);
+	free(cs.dfltTag);
 ENDfreeCnf
 
 /* open journal */
@@ -790,6 +809,8 @@ CODESTARTsetModCnf
 			free(fac);
 		} else if (!strcmp(modpblk.descr[i].name, "usepidfromsystem")) {
 			cs.bUseJnlPID = (int) pvals[i].val.d.n;
+		} else if (!strcmp(modpblk.descr[i].name, "defaulttag")) {
+			cs.dfltTag = (char *)es_str2cstr(pvals[i].val.d.estr, NULL);
 		} else {
 			dbgprintf("imjournal: program error, non-handled "
 				"param '%s' in beginCnfLoad\n", modpblk.descr[i].name);
@@ -852,6 +873,8 @@ CODEmodInit_QueryRegCFSLineHdlr
 		facilityHdlr, &cs.iDfltFacility, STD_LOADABLE_MODULE_ID));
 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"imjournalusepidfromsystem", 0, eCmdHdlrBinary,
 		NULL, &cs.bUseJnlPID, STD_LOADABLE_MODULE_ID));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)"imjournaldefaulttag", 0, eCmdHdlrGetWord,
+		NULL, &cs.dfltTag, STD_LOADABLE_MODULE_ID));
 ENDmodInit
 /* vim:set ai:
  */
