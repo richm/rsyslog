@@ -496,8 +496,7 @@ pollJournal(void)
 		}
 
 		iRet = loadJournalState();
-		errmsg.LogError(0, RS_RET_OK, "imjournal: "
-			"journal reloaded...");	
+		LogMsg(0, RS_RET_OK, LOG_NOTICE, "imjournal: journal reloaded...");
 	} else if (jr < 0) {
 		char errStr[256];
 		rs_strerror_r(errno, errStr, sizeof(errStr));
