@@ -1317,6 +1317,10 @@ initAll(int argc, char **argv)
 				perror("chroot");
 				exit(1);
 			}
+            if(chdir("/") != 0) {
+                perror("chdir");
+                exit(1);
+            }
 			break;
 		case 'u':		/* misc user settings */
 			iHelperUOpt = (arg == NULL) ? 0 : atoi(arg);
