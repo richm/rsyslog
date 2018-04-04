@@ -112,6 +112,25 @@ static const char *pid_field_name;	/* read-only after startup */
 static ratelimit_t *ratelimiter = NULL;
 static sd_journal *j;
 
+static rsRetVal persistJournalState(void);
+static rsRetVal loadJournalState(void);
+
+static rsRetVal openJournal(sd_journal** jj) {
+	DEFiRet;
+
+	if (sd_journal_open(jj, SD_JOURNAL_LOCAL_ONLY) < 0)
+		iRet = RS_RET_IO_ERROR;
+	RETiRet;
+}
+
+static void closeJournal(sd_journal** jj) {
+
+	if (cs.stateFile) { /* can't persist without a state file */
+		persistJournalState();
+	}
+	sd_journal_close(*jj);
+}
+
 
 /* ugly workaround to handle facility numbers; values
  * derived from names need to be eight times smaller,
@@ -423,20 +442,25 @@ persistJournalState (void)
 }
 
 
+static rsRetVal skipOldMessages(void);
 /* Polls the journal for new messages. Similar to sd_journal_wait()
  * except for the special handling of EINTR.
  */
+
+#define POLL_TIMEOUT 1000 /* timeout for poll is 1s */
+
 static rsRetVal
 pollJournal(void)
 {
 	DEFiRet;
 	struct pollfd pollfd;
-	int r;
+	int pr = 0;
+	int jr = 0;
 
 	pollfd.fd = sd_journal_get_fd(j);
 	pollfd.events = sd_journal_get_events(j);
-	r = poll(&pollfd, 1, -1);
-	if (r == -1) {
+	pr = poll(&pollfd, 1, POLL_TIMEOUT);
+	if (pr == -1) {
 		if (errno == EINTR) {
 			/* EINTR is also received during termination
 			 * so return now to check the term state.
@@ -452,12 +476,30 @@ pollJournal(void)
 		}
 	}
 
-	assert(r == 1);
 
-	r = sd_journal_process(j);
-	if (r < 0) {
+	jr = sd_journal_process(j);
+	
+	if (pr == 1 && jr == SD_JOURNAL_INVALIDATE) {
+		/* do not persist stateFile sd_journal_get_cursor will fail! */
+		char* tmp = cs.stateFile;
+		cs.stateFile = NULL;
+		closeJournal(&j);
+		cs.stateFile = tmp;
+
+		iRet = openJournal(&j);
+		if (iRet != RS_RET_OK) {
+			char errStr[256];
+			rs_strerror_r(errno, errStr, sizeof(errStr));
+			errmsg.LogError(0, RS_RET_IO_ERROR,
+				"sd_journal_open() failed: '%s'", errStr);
+			ABORT_FINALIZE(RS_RET_ERR);
+		}
+
+		iRet = loadJournalState();
+		errmsg.LogError(0, RS_RET_OK, "imjournal: "
+			"journal reloaded...");	
+	} else if (jr < 0) {
 		char errStr[256];
-
 		rs_strerror_r(errno, errStr, sizeof(errStr));
 		errmsg.LogError(0, RS_RET_ERR,
 			"sd_journal_process() failed: '%s'", errStr);
@@ -677,20 +719,13 @@ ENDfreeCnf
 /* open journal */
 BEGINwillRun
 CODESTARTwillRun
-	int ret;
-	ret = sd_journal_open(&j, SD_JOURNAL_LOCAL_ONLY);
-	if (ret < 0) {
-		iRet = RS_RET_IO_ERROR;
-	}
+	iRet = openJournal(&j);
 ENDwillRun
 
 /* close journal */
 BEGINafterRun
 CODESTARTafterRun
-	if (cs.stateFile) { /* can't persist without a state file */
-		persistJournalState();
-	}
-	sd_journal_close(j);
+	closeJournal(&j);
 	ratelimitDestruct(ratelimiter);
 ENDafterRun
 
