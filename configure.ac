@@ -1559,6 +1559,18 @@ AC_ARG_ENABLE(pmpanngfw,
 )
 AM_CONDITIONAL(ENABLE_PMPANNGFW, test x$enable_pmpanngfw = xyes)
 
+# settings for pmrfc3164sd
+AC_ARG_ENABLE(pmrfc3164sd,
+        [AS_HELP_STRING([--enable-pmrfc3164sd],[Compiles rfc3164sd parser module @<:@default=no@:>@])],
+        [case "${enableval}" in
+         yes) enable_pmrfc3164sd="yes" ;;
+          no) enable_pmrfc3164sd="no" ;;
+           *) AC_MSG_ERROR(bad value ${enableval} for --enable-pmrfc3164sd) ;;
+         esac],
+        [enable_pmrfc3164sd=no]
+)
+AM_CONDITIONAL(ENABLE_PMRFC3164SD, test x$enable_pmrfc3164sd = xyes)
+
 
 # settings for omruleset
 AC_ARG_ENABLE(omruleset,
@@ -1953,6 +1965,7 @@ AC_CONFIG_FILES([Makefile \
 		plugins/mmexternal/Makefile \
 		plugins/omstdout/Makefile \
 		plugins/omjournal/Makefile \
+		plugins/pmrfc3164sd/Makefile \
 		plugins/pmciscoios/Makefile \
 		plugins/pmnull/Makefile \
 		plugins/omruleset/Makefile \
@@ -2057,6 +2070,7 @@ echo "    omamqp1 module will be compiled:          $enable_omamqp1"
 echo "    omtcl module will be compiled:            $enable_omtcl"
 echo
 echo "---{ parser modules }---"
+echo "    pmrfc3164sd module will be compiled:      $enable_pmrfc3164sd"
 echo "    pmlastmsg module will be compiled:        $enable_pmlastmsg"
 echo "    pmcisconames module will be compiled:     $enable_pmcisconames"
 echo "    pmciscoios module will be compiled:       $enable_pmciscoios"
