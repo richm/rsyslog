@@ -526,7 +526,24 @@ loadJournalState(void)
 						"couldn't seek to cursor `%s'\n", readCursor);
 					iRet = RS_RET_ERR;
 				} else {
+					char * tmp_cursor = NULL;
 					sd_journal_next(j);
+					/*
+ 					* This is resolving the situation when system is after reboot and boot_id doesn't match
+ 					* so cursor pointing into "future". Usually sd_journal_next jump to head of journal due to journal aproximation,
+ 					* but when system time goes backwards and cursor is still invalid, rsyslog stops logging. We use
+ 					* sd_journal_get_cursor to validate our cursor. When cursor is invalid we are trying to jump to the head of journal
+ 					* This problem with time is not affecting persistent journal.
+ 					* */
+					if (sd_journal_get_cursor(j, &tmp_cursor) < 0 && sd_journal_has_persistent_files(j) == 0) {
+						errmsg.LogError(0, RS_RET_IO_ERROR, "imjournal: "
+                                        	"loaded invalid cursor, seeking to the head of journal\n");
+						if (sd_journal_seek_head(j) < 0) {
+							errmsg.LogError(0, RS_RET_ERR, "imjournal: "
+                                                	"sd_journal_seek_head() failed, when cursor is invalid\n");
+							iRet = RS_RET_ERR;
+						}
+					} 
 				}
 			} else {
 				errmsg.LogError(0, RS_RET_IO_ERROR, "imjournal: "
