@@ -573,6 +573,15 @@ TESTS += \
 	 omtcl.sh
 endif
 
+if ENABLE_MMKUBERNETES
+TESTS += \
+	mmkubernetes-basic.sh
+if HAVE_VALGRIND
+TESTS += \
+	mmkubernetes-basic-vg.sh
+endif
+endif
+
 endif # if ENABLE_TESTBENCH
 
 TESTS_ENVIRONMENT = RSYSLOG_MODDIR='$(abs_top_builddir)'/runtime/.libs/
@@ -1402,7 +1411,9 @@ EXTRA_DIST= \
 	testsuites/sndrcv_tls_anon_sender.conf \
 	testsuites/sndrcv_tls_anon_rcvr.conf \
 	omtcl.sh \
-	omtcl.tcl
+	omtcl.tcl \
+	mmkubernetes-basic.sh \
+	mmkubernetes-basic-vg.sh
 
 ourtail_SOURCES = ourtail.c
 msleep_SOURCES = msleep.c
