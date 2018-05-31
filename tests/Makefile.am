@@ -434,6 +434,9 @@ if HAVE_VALGRIND
 TESTS +=  \
 	mmexternal-SegFault-empty-jroot-vg.sh
 endif
+if ENABLE_IMFILE
+	imfile-symlink.sh
+endif
 endif
 
 # disable temporarily due to issues
