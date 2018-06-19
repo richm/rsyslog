@@ -569,7 +569,8 @@ TESTS +=  \
 	es-basic-errfile-empty.sh \
 	es-basic-errfile-popul.sh \
 	es-bulk-errfile-empty.sh \
-	es-bulk-errfile-popul.sh
+	es-bulk-errfile-popul.sh \
+	es-writeoperation.sh
 if HAVE_VALGRIND
 TESTS += \
 	es-basic-vgthread.sh
@@ -717,6 +718,22 @@ endif
 endif
 endif
 
+if ENABLE_OPENSSL
+TESTS +=  \
+	imtcp-tls-ossl-basic.sh \
+	sndrcv_tls_ossl_anon_ipv4.sh \
+	sndrcv_tls_ossl_anon_ipv6.sh \
+	sndrcv_tls_ossl_anon_rebind.sh \
+	imtcp-tls-ossl-x509valid.sh \
+	imtcp-tls-ossl-x509name.sh \
+	imtcp-tls-ossl-x509fingerprint.sh
+if HAVE_VALGRIND
+TESTS += \
+	imtcp-tls-ossl-basic-vg.sh
+endif
+endif
+
+
 if ENABLE_OMUXSOCK
 TESTS += uxsock_simple.sh
 endif
@@ -804,6 +821,9 @@ TESTS += \
 	imfile-endregex-timeout-with-shutdown.sh \
 	imfile-endregex-timeout-with-shutdown-polling.sh \
 	imfile-persist-state-1.sh \
+	imfile-freshStartTail1.sh \
+	imfile-freshStartTail2.sh \
+	imfile-freshStartTail3.sh \
 	imfile-wildcards.sh \
 	imfile-wildcards-dirs.sh \
 	imfile-wildcards-dirs2.sh \
@@ -1287,6 +1307,20 @@ EXTRA_DIST= \
 	testsuites/udp-msgreduc-vg.conf \
 	manytcp-too-few-tls-vg.sh \
 	testsuites/manytcp-too-few-tls.conf \
+	imtcp-tls-ossl-basic.sh \
+	sndrcv_tls_ossl_anon_ipv4.sh \
+	testsuites/sndrcv_tls_ossl_anon_ipv4_sender.conf \
+	testsuites/sndrcv_tls_ossl_anon_ipv4_rcvr.conf \
+	sndrcv_tls_ossl_anon_ipv6.sh \
+	testsuites/sndrcv_tls_ossl_anon_ipv6_sender.conf \
+	testsuites/sndrcv_tls_ossl_anon_ipv6_rcvr.conf \
+	sndrcv_tls_ossl_anon_rebind.sh \
+	testsuites/sndrcv_tls_ossl_anon_rebind_sender.conf \
+	testsuites/sndrcv_tls_ossl_anon_rebind_rcvr.conf \
+	imtcp-tls-ossl-x509valid.sh \
+	imtcp-tls-ossl-x509name.sh \
+	imtcp-tls-ossl-x509fingerprint.sh \
+	imtcp-tls-ossl-basic-vg.sh \
 	manytcp.sh \
 	testsuites/manytcp.conf \
 	manyptcp.sh \
@@ -1535,6 +1569,9 @@ EXTRA_DIST= \
 	imfile-endregex-timeout-with-shutdown.sh \
 	imfile-endregex-timeout-with-shutdown-polling.sh \
 	imfile-persist-state-1.sh \
+	imfile-freshStartTail1.sh \
+	imfile-freshStartTail2.sh \
+	imfile-freshStartTail3.sh \
 	imfile-truncate.sh \
 	imfile-wildcards.sh \
 	imfile-wildcards-dirs.sh \
@@ -1904,7 +1941,10 @@ EXTRA_DIST= \
 	pgsql-actq-mt-withpause-vg.sh \
 	../devtools/prep-mysql-db.sh \
 	mmkubernetes-basic.sh \
-	mmkubernetes-basic-vg.sh
+	mmkubernetes-basic-vg.sh \
+	mmkubernetes_test_server.py \
+	mmkubernetes-basic.out.json \
+	es-writeoperation.sh
 
 ourtail_SOURCES = ourtail.c
 msleep_SOURCES = msleep.c
@@ -1917,11 +1957,18 @@ uxsockrcvr_SOURCES = uxsockrcvr.c
 uxsockrcvr_LDADD = $(SOL_LIBS)
 
 tcpflood_SOURCES = tcpflood.c
-tcpflood_CFLAGS = $(PTHREADS_CFLAGS) $(RELP_CFLAGS) $(GNUTLS_CFLAGS)
-tcpflood_CPPFLAGS = $(PTHREADS_CFLAGS) $(RELP_CFLAGS) $(GNUTLS_CFLAGS)
-tcpflood_LDADD = $(SOL_LIBS) $(PTHREADS_LIBS) $(RELP_LIBS) $(GNUTLS_LIBS)
+tcpflood_CFLAGS = $(PTHREADS_CFLAGS) $(RELP_CFLAGS)
+tcpflood_CPPFLAGS = $(PTHREADS_CFLAGS) $(RELP_CFLAGS)
+tcpflood_LDADD = $(SOL_LIBS) $(PTHREADS_LIBS) $(RELP_LIBS)
 if ENABLE_GNUTLS
-tcpflood_LDADD += -lgcrypt
+tcpflood_CFLAGS += $(GNUTLS_CFLAGS)
+tcpflood_CPPFLAGS += $(GNUTLS_CFLAGS)
+tcpflood_LDADD += $(GNUTLS_LIBS) -lgcrypt
+endif
+if ENABLE_OPENSSL
+tcpflood_CFLAGS += $(OPENSSL_CFLAGS)
+tcpflood_CPPFLAGS += $(OPENSSL_CFLAGS)
+tcpflood_LDADD += $(OPENSSL_LIBS)
 endif
 
 minitcpsrv_SOURCES = minitcpsrvr.c

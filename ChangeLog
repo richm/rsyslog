@@ -17,6 +17,35 @@ Version 8.36.0 [v8-stable] 2018-06-26
   know what is going on and my react.
   closes https://github.com/rsyslog/rsyslog/issues/2705
   see also https://github.com/rsyslog/rsyslog/issues/2706
+- add openssl driver alongside GnuTLS one for TLS communication
+  The openssl driver is curently experimental. It will become the new preferred
+  driver as it permits us to provide much better end-user error message than
+  we could provide with GnuTLS. It is also less picky with certificate files
+  and provides specific error messages if there are certificate problems.
+  closes: https://github.com/rsyslog/rsyslog/issues/1390
+  closes: https://github.com/rsyslog/rsyslog/issues/1840
+  closes: https://github.com/rsyslog/rsyslog/issues/1352
+  closes: https://github.com/rsyslog/rsyslog/issues/1702
+  closes: https://github.com/rsyslog/rsyslog/issues/2547
+- GnuTLS TLS driver: support intermediate certificates
+  this is necessary for certificate chains
+  Thanks to Arne Nordmark for providing the patch.
+  closes https://github.com/rsyslog/rsyslog/issues/2762
+- omelasticsearch: write op types; bulk rejection retries
+  * Add support for a 'create' write operation type in addition to
+    the default 'index'.  Using create allows specifying a unique id
+    for each record, and allows duplicate document detection.
+  * Add support for checking each record returned in a bulk index
+    request response.  Allow specifying a ruleset to send each failed
+    record to.  Add a local variable `omes` which contains the
+    information in the error response, so that users can control how
+    to handle responses e.g. retry, or send to an error file.
+  * Add support for response stats - count successes, duplicates, and
+    different types of failures.
+  * Add testing for bulk index rejections.
+  Thanks to Richard Megginson for the patch.
+- lookup tables: reload message now with "info" severity (was "error")
+  thanks to Adam Chalkley for the patch
 - imjournal: add statistics counter
   following statistics counter are now supported by imjournal
   - submitted = total number of messages submitted for processing
@@ -25,10 +54,57 @@ Version 8.36.0 [v8-stable] 2018-06-26
   permit 4-digit file creation modes (actually 5 with the leading zero) so
   that the setgid bit can also be set (and anything else on that position.
   closes https://github.com/rsyslog/rsyslog/issues/1092
+- omprog: simplify 'plugin-with-feedback.py' example
+  Make the skeleton easier to understand by removing transaction support.
+  Also, transaction failures did not work as explained in the skeleton,
+  because of issue #2420. In the future, a 'plugin-with-transactions.py'
+  example can be added, ideally once the issue is solved.
+  Thanks to Joan Sala for contributing this.
+- core: misadressing when writing disk queue files
+  when writing disk queue files during shutdown, access to freed
+  memory can occur under these circumstances:
+  - action A is processing data, but could not complete it
+    most importantly, the current in-process batch needs not to
+    be totally completed. Most probable cause for this scenario
+    is a suspended action in retry mode.
+  - action A is called from a ruleset RA which
+    - does not have a queue assigned
+    - where RA is called from a ruleset RO which is bound
+      to the input from which the message originated
+    - RO must be defined before RA inside the expanded config
+  - Disk queues (or the disk part of a DA queue) must be utilized by A
+  When re-injecting the unprocessed messages from A into the disk queue, the
+  name of ruleset RO is accessed (for persisting to disk). However, RO is
+  already destructed at this point in time.
+  The patch changes the shutdown processing of rulesets, so that all
+  shutdown processing is done before any ruleset data is destructed. This
+  ensures that all data items which potentially need to be accessed
+  remain valid as long as some part may potentially try to access them.
+  This follows a the approach used in
+     https://github.com/rsyslog/rsyslog/pull/1857
+  where obviously that part of the problem was not noticed.
+  see also https://github.com/rsyslog/rsyslog/issues/1122
+  closes https://github.com/rsyslog/rsyslog/issues/2742
+- core: fix message loss on target unavailibility during shutdown
+  Triggering condition:
+  - action queue in disk mode (or DA)
+  - batch is being processed by failed action in retry mode
+  - rsyslog is shut down without resuming action
+  In these cases messages may be lost by not properly writing them
+  back to the disk queue.
+  closes https://github.com/rsyslog/rsyslog/issues/2760
 - imrelp bugfix: error message "librelp too old" is always emitted ...
   ... even if librelp is current. The codition check was actually missing.
   This commit adds it.
   closes https://github.com/rsyslog/rsyslog/issues/2712
+- imrelp: segfault on startup when cert without priv key is configured
+  closes https://github.com/rsyslog/rsyslog/issues/2747
+- omrelp bugfix: segfault on first message sent when authmode was wrong
+  A segfault could occur if the authmode was configured to an invalid value.
+  This is now caught during config processing and an error is reported.
+  closes https://github.com/rsyslog/rsyslog/issues/2743
+- imfile bugfix: double-free on module shutdown
+  detected by code review, not seen in practice
 - imfile/core bugfix: potential misadressing in string copy routine
   This can be exposed via imfile, as follows:
   - use a regex to process multiline messages
@@ -39,6 +115,26 @@ Version 8.36.0 [v8-stable] 2018-06-26
   This leads to a misadressing, which may have no obvious effects potentially
   up to a segfault.
   closes https://github.com/rsyslog/rsyslog/issues/2661
+- imfile bugfix: if freshStartTail is set some initial file lines missing
+  When the option is set and a new file is created after rsyslog startup,
+  freshStartTail is also applied to it. That is data written quickly to it
+  (before rsyslog can process it) will potentially be discarded. If so,
+  and how much, depends on the timing between rsyslog and the logging process.
+  This problem is most likely to be seen in polling mode, where a relatively
+  long time may be required for rsyslog to find the new file.
+  This is changed so that now freshStartTail only applies to files that
+  are already-existing during rsyslog's initial processing of the file
+  monitors. HOWEVER, depending on the number and location (network?) of
+  existing files, this initial startup processing may take some time as
+  well. If another process creates a new file at exactly the time of
+  startup processing and writes data to it, rsyslog might detect this
+  file and it's data as prexisting and may skip it. This race is inevitable.
+  So when freshStartTail is used, some risk of data loss exists. The same
+  holds true if between the last shutdown of rsyslog and its restart log
+  file content has been added. This is no rsyslog bug if it occurs.
+  As such, the rsyslog team advises against activating the freshStartTail
+  option.
+  closes https://github.com/rsyslog/rsyslog/issues/2464
 - core: fix undefined behaviour (unsigned computation may lead to value < 0)
   This was detected by LLVM UBSAN. On some platforms re-setting the rawmsg
   inside the message object could lead to invalid computation due to the
