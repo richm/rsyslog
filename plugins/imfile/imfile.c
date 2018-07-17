@@ -154,6 +154,10 @@ struct act_obj_s {
 	fs_edge_t *edge;	/* edge which this object belongs to */
 	char *name;		/* full path name of active object */
 	char *basename;		/* only basename */ //TODO: remove when refactoring rename support
+	char *link_target;      /* if this object is a symlink, link_target is the name of the target file
+	                           as returned by readlink(2), else NULL */
+	char *link_source;      /* if this object is a file and not a symlink, link_source is the name of the symlink
+	                           that links to this file, if any, or NULL if no symlink point to this file */
 	//char *statefile;	/* base name of state file (for move operations) */
 	int wd;
 #if defined(OS_SOLARIS) && defined (HAVE_PORT_SOURCE_FILE)
@@ -559,26 +563,27 @@ static int
 isSymlink(char *file, char **target)
 {
 	int is_symlink = 0;
-	char *result = NULL;
-	result = realpath(file, result);
-	if (NULL == result) {
-		LogError(errno, RS_RET_ERR, "imfile: isSymlink: realpath on %s failed", file);
-		return -1;
-	}
+	char link_target[PATH_MAX+1];
+	ssize_t link_target_len = 0;
 
-	if(strcmp(file, result)) {
-		DBGPRINTF("imfile: isSymlink: found %s --> %s\n", file, result);
-		is_symlink = 1;
-		if (NULL != target) {
-			*target = strdup(result);
-			if (NULL == target) {
-				LogError(errno, RS_RET_OUT_OF_MEMORY, "imfile: isSymlink: malloc failed");
-				free(result);
-				return RS_RET_OUT_OF_MEMORY;
-			}
+	if (-1 == (link_target_len = readlink(file, link_target, sizeof(link_target)))) {
+		if (errno == EINVAL) {
+			return 0; /* not a symlink */
+		} else {
+			LogError(errno, RS_RET_ERR, "imfile: isSymlink: readlink [%s] failed", file);
+			return RS_RET_ERR;
 		}
 	}
-	free(result);
+	link_target[link_target_len] = '\0';
+	DBGPRINTF("imfile: isSymlink: found %s --> %s\n", file, link_target);
+	is_symlink = 1;
+	if (NULL != target) {
+		*target = strdup(link_target);
+		if (NULL == *target) {
+			LogError(errno, RS_RET_OUT_OF_MEMORY, "imfile: isSymlink: malloc failed");
+			return RS_RET_OUT_OF_MEMORY;
+		}
+	}
 	return is_symlink;
 }
 
@@ -676,12 +681,13 @@ fs_node_print(const fs_node_t *const node, const int level)
 /* add a new file system object if it not yet exists, ignore call
  * if it already does.
  */
-static rsRetVal ATTR_NONNULL()
+static rsRetVal ATTR_NONNULL(1,2)
 act_obj_add(fs_edge_t *const edge, const char *const name, const int is_file,
-	const ino_t ino, const int is_symlink)
+	const ino_t ino, const int is_symlink, const char *const target)
 {
 	act_obj_t *act;
 	char basename[MAXFNAME];
+	const char *link_source = NULL;
 	DEFiRet;
 	
 	DBGPRINTF("act_obj_add: edge %p, name '%s'\n", edge, name);
@@ -691,18 +697,35 @@ act_obj_add(fs_edge_t *const edge, const char *const name, const int is_file,
 				name, edge->path);
 			FINALIZE;
 		}
+		if(act->link_target && !strcmp(act->link_target, name)) {
+			if (act->link_source) {
+				link_source = act->link_source;
+			} else {
+				/* set link_source to act->name */
+				link_source = act->name;
+			}
+		}
 	}
 	DBGPRINTF("add new active object '%s' in '%s'\n", name, edge->path);
 	CHKmalloc(act = calloc(sizeof(act_obj_t), 1));
 	CHKmalloc(act->name = strdup(name));
-	getBasename((uchar*)basename, (uchar*)name);
-	CHKmalloc(act->basename = strdup(basename));
+	if (-1 == getBasename((uchar*)basename, (uchar*)name)) {
+		/* assume basename is same as name */
+		CHKmalloc(act->basename = strdup(name));
+	} else {
+		CHKmalloc(act->basename = strdup(basename));
+	}
 	act->edge = edge;
 	act->ino = ino;
 	act->is_symlink = is_symlink;
 	#ifdef HAVE_INOTIFY_INIT
 	act->wd = in_setupWatch(act, is_file);
 	#endif
+	if (target)
+		CHKmalloc(act->link_target = strdup(target));
+	if (link_source)
+		CHKmalloc(act->link_source = strdup(link_source));
+
 	fen_setupWatch(act);
 	if(is_file && !is_symlink) {
 		const instanceConf_t *const inst = edge->instarr[0];// TODO: same file, multiple instances?
@@ -858,7 +881,7 @@ poll_tree(fs_edge_t *const chld)
 
 			char *target = NULL;
 			issymlink = isSymlink(file, &target);
-			if (issymlink == -1) { /* some serious problem with the file - skip */
+			if (issymlink < 0) { /* some serious problem with the file - skip */
 				continue;
 			}
 			/* need to add watch for symlink as well in case of target change */
@@ -879,6 +902,7 @@ poll_tree(fs_edge_t *const chld)
 				continue;
 			} else { /* not a symlink */
 				free(target);
+				target = NULL;
 			}
 			if(!is_file && S_ISREG(fileInfo.st_mode)) {
 				LogMsg(0, RS_RET_ERR, LOG_WARNING,
@@ -893,7 +917,7 @@ poll_tree(fs_edge_t *const chld)
 					(chld->is_file) ? "FILE" : "DIRECTORY");
 				continue;
 			}
-			act_obj_add(chld, file, is_file, fileInfo.st_ino, issymlink);
+			act_obj_add(chld, file, is_file, fileInfo.st_ino, issymlink, target);
 		}
 		globfree(&files);
 	}
@@ -922,7 +946,7 @@ poll_timeouts(fs_edge_t *const edge)
 
 /* destruct a single act_obj object */
 static void
-act_obj_destroy(act_obj_t *const act, const int is_deleted)
+act_obj_destroy(act_obj_t *const act, const int is_deleted, const int is_shutdown)
 {
 	uchar *statefn;
 	uchar statefile[MAXFNAME];
@@ -931,9 +955,9 @@ act_obj_destroy(act_obj_t *const act, const int is_deleted)
 	if(act == NULL)
 		return;
 
-	DBGPRINTF("act_obj_destroy: act %p '%s', wd %d, pStrm %p, is_deleted %d, in_move %d\n",
-		act, act->name, act->wd, act->pStrm, is_deleted, act->in_move);
-	if(act->is_symlink) {
+	DBGPRINTF("act_obj_destroy: act %p '%s', wd %d, pStrm %p, is_deleted %d, in_move %d, is_symlink %d\n",
+		act, act->name, act->wd, act->pStrm, is_deleted, act->in_move, act->is_symlink);
+	if(!is_shutdown && act->is_symlink) {
 		char *ptr;
 		/* Check if slink -> target is in the hashtable. */
 		ptr = hashtable_search(slink_target, act->name);
@@ -981,6 +1005,8 @@ act_obj_destroy(act_obj_t *const act, const int is_deleted)
 	free(act->basename);
 	//free(act->statefile);
 	free(act->multiSub.ppMsgs);
+	free(act->link_target);
+	free(act->link_source);
 	#if defined(OS_SOLARIS) && defined (HAVE_PORT_SOURCE_FILE)
 		act->is_deleted = 1;
 	#else
@@ -1001,7 +1027,7 @@ act_obj_destroy_all(act_obj_t *act)
 	while(act != NULL) {
 		act_obj_t *const toDel = act;
 		act = act->next;
-		act_obj_destroy(toDel, 0);
+		act_obj_destroy(toDel, 0, 1 /* is_shutdown */);
 	}
 }
 
@@ -1037,7 +1063,7 @@ act_obj_unlink(act_obj_t *const act)
 	if(act->next != NULL) {
 		act->next->prev = act->prev;
 	}
-	act_obj_destroy(act, 1);
+	act_obj_destroy(act, 1, 0 /* not is_shutdown */);
 //dbgprintf("printout of fs tree post unlink\n");
 //fs_node_print(runModConf->conf_tree, 0);
 //dbg_wdmapPrint("wdmap after");
@@ -1279,7 +1305,11 @@ enqLine(act_obj_t *const act,
 	msgSetPRI(pMsg, inst->iFacility | inst->iSeverity);
 	MsgSetRuleset(pMsg, inst->pBindRuleset);
 	if(inst->addMetadata) {
-		metadata_values[0] = (const uchar*)act->name;
+		if (act->link_source) {
+			metadata_values[0] = (const uchar*)act->link_source;
+		} else {
+			metadata_values[0] = (const uchar*)act->name;
+		}
 		snprintf((char *)file_offset, MAX_OFFSET_REPRESENTATION_NUM_BYTES+1, "%lld", strtOffs);
 		metadata_values[1] = file_offset;
 		msgAddMultiMetadata(pMsg, metadata_names, metadata_values, 2);
